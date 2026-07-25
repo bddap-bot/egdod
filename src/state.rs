@@ -41,7 +41,6 @@ pub struct Status {
     pub node_id: String,
     pub pid: u32,
     pub updated_unix: u64,
-    pub relay_enabled: bool,
     pub direct_addrs: Vec<String>,
     /// `None` until the first probe completes.
     pub dialable: Option<bool>,
@@ -52,6 +51,18 @@ pub struct Status {
     pub consecutive_probe_failures: u32,
     pub endpoint_restarts: u32,
     pub sessions: Vec<SessionInfo>,
+}
+
+/// Most-recent pending agents kept. See `record_pending`.
+const PENDING_LIMIT: usize = 256;
+
+impl Status {
+    /// Whether the process that wrote this file is still alive. Without it,
+    /// `status` would cheerfully report a dead controller's last opinion of
+    /// itself — the exact "looks healthy" failure the spec is about.
+    pub fn writer_alive(&self) -> bool {
+        Path::new(&format!("/proc/{}", self.pid)).exists()
+    }
 }
 
 pub fn now_unix() -> u64 {
@@ -103,18 +114,11 @@ impl StateDir {
         Ok(())
     }
 
-    /// Creates the controller key if absent. The NodeId derived from it is the
-    /// one public thing that gets baked into images.
+    /// The NodeId derived from this key is the one public thing that gets baked
+    /// into images, so creating it is `init`'s whole job.
     pub fn init_key(&self) -> Result<SecretKey> {
         self.ensure()?;
-        let path = self.key_path();
-        if let Some(k) = read_key(&path)? {
-            return Ok(k);
-        }
-        let mut bytes = [0u8; 32];
-        getrandom::getrandom(&mut bytes).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
-        write_private(&path, &bytes)?;
-        Ok(SecretKey::from_bytes(&bytes))
+        load_or_create_key(&self.key_path())
     }
 
     pub fn load_key(&self) -> Result<SecretKey> {
@@ -125,6 +129,16 @@ impl StateDir {
                 self.key_path().display()
             ),
         }
+    }
+
+    pub fn ssh_key_path(&self) -> PathBuf {
+        self.ssh_dir().join("id_ed25519")
+    }
+    pub fn ssh_pub_path(&self) -> PathBuf {
+        self.ssh_dir().join("id_ed25519.pub")
+    }
+    pub fn known_hosts_path(&self) -> PathBuf {
+        self.ssh_dir().join("known_hosts")
     }
 
     /// Read fresh on every connection attempt, so `approve` takes effect without
@@ -196,6 +210,14 @@ impl StateDir {
                 attempts: 1,
             }),
         }
+        // The node id is public, so anyone can dial with a fresh key and add an
+        // entry. Keeping only the most recent PENDING_LIMIT bounds what a stranger
+        // can cost a controller that may be a phone.
+        if list.len() > PENDING_LIMIT {
+            list.sort_by_key(|p| p.last_seen_unix);
+            let excess = list.len() - PENDING_LIMIT;
+            list.drain(..excess);
+        }
         self.write_pending(&list)
     }
 
@@ -237,6 +259,7 @@ fn read_key(path: &Path) -> Result<Option<SecretKey>> {
             let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
                 anyhow::anyhow!("key file {} is not 32 bytes", path.display())
             })?;
+            warn_if_readable(path);
             Ok(Some(SecretKey::from_bytes(&arr)))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -244,41 +267,85 @@ fn read_key(path: &Path) -> Result<Option<SecretKey>> {
     }
 }
 
-#[cfg(unix)]
+/// Loads the key at `path`, creating one if there is none.
+///
+/// Shared by the controller and the agent so there is one answer to "where does
+/// an identity come from" — and, for the agent, so a half-written key from a
+/// power cut during first boot is replaced rather than becoming a permanent
+/// crash on a machine with no screen.
+pub fn load_or_create_key(path: &Path) -> Result<SecretKey> {
+    match read_key(path) {
+        Ok(Some(k)) => return Ok(k),
+        Ok(None) => {}
+        Err(e) => {
+            tracing::error!("replacing unusable key file {}: {e:#}", path.display());
+        }
+    }
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+            restrict(parent)?;
+        }
+    }
+    write_private(path, &bytes)?;
+    Ok(SecretKey::from_bytes(&bytes))
+}
+
+fn warn_if_readable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mode = meta.permissions().mode();
+        if mode & 0o077 != 0 {
+            tracing::warn!(
+                "{} is mode {:o}: the key that owns every approved target is readable by others",
+                path.display(),
+                mode & 0o7777
+            );
+        }
+    }
+}
+
 fn restrict(dir: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
         .with_context(|| format!("restricting {}", dir.display()))
 }
 
-#[cfg(not(unix))]
-fn restrict(_dir: &Path) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+    // Written to a side file and renamed into place, fsynced first: an identity
+    // that exists must be complete, because half a key file is indistinguishable
+    // from a whole one by length alone on the next boot.
+    let tmp = unique_tmp(path);
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)
-        .with_context(|| format!("creating {}", path.display()))?;
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
     f.write_all(bytes).context("writing key")?;
-    Ok(())
+    f.sync_all().context("flushing key")?;
+    drop(f);
+    std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))
 }
 
-#[cfg(not(unix))]
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
+/// A staging path unique to this process, because `serve` and a concurrent
+/// `approve` write the same files and a shared temp name would let them splice
+/// each other's bytes into one unparseable file.
+fn unique_tmp(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp.{}", std::process::id()));
+    path.with_file_name(name)
 }
 
 /// Temp-then-rename: a reader (`pending --json` on a script's timer, or a restart
 /// mid-write) must never see a half-written file.
 fn write_atomic(path: &Path, body: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
+    let tmp = unique_tmp(path);
     std::fs::write(&tmp, body).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))
 }

@@ -197,15 +197,9 @@ pub async fn stat_and_hash(path: &Path) -> Result<(u32, u64, [u8; 32])> {
     Ok((mode, len, hasher.finalize().into()))
 }
 
-#[cfg(unix)]
 fn mode_of(meta: &std::fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     meta.permissions().mode() & 0o7777
-}
-
-#[cfg(not(unix))]
-fn mode_of(_meta: &std::fs::Metadata) -> u32 {
-    0o644
 }
 
 pub async fn send_file_body<W>(w: &mut W, path: &Path) -> Result<()>
@@ -240,6 +234,11 @@ pub async fn recv_file_body<R>(
 where
     R: AsyncRead + Unpin,
 {
+    ensure!(
+        dest.file_name().is_some(),
+        "{} is not a file path",
+        dest.display()
+    );
     // The agent may be writing into a directory that does not exist yet and has
     // no shell available to create one.
     if let Some(parent) = dest.parent() {
@@ -249,10 +248,7 @@ where
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
     }
-    let tmp = temp_path(dest);
-    let mut out = tokio::fs::File::create(&tmp)
-        .await
-        .with_context(|| format!("creating {}", tmp.display()))?;
+    let (tmp, mut out) = create_part_file(dest).await?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; CHUNK];
     let mut got = 0u64;
@@ -266,11 +262,16 @@ where
         }
         hasher.update(&buf[..n]);
         got += n as u64;
+        // Stop at the announced size instead of writing whatever the peer keeps
+        // sending: the length is the peer's claim, and the disk is ours.
+        if got > len {
+            break Err(anyhow::anyhow!("peer sent more than the announced {len} bytes"));
+        }
         if let Err(e) = out.write_all(&buf[..n]).await {
             break Err(anyhow::Error::from(e).context("writing file body"));
         }
     };
-    let flushed = out.flush().await;
+    let flushed = out.sync_all().await;
     drop(out);
     let verdict = (|| {
         outcome?;
@@ -291,23 +292,41 @@ where
     Ok(())
 }
 
-fn temp_path(dest: &Path) -> PathBuf {
-    let mut name = dest.file_name().unwrap_or_default().to_os_string();
-    name.push(".egdod-part");
-    dest.with_file_name(name)
+/// Creates the staging file next to `dest`, refusing to open anything that
+/// already exists.
+///
+/// `create_new` matters twice over: the writer is typically root, so a
+/// predictable name that an unprivileged local user could pre-create as a
+/// symlink would be a write-anywhere primitive; and two concurrent copies to the
+/// same destination must not share a staging file.
+async fn create_part_file(dest: &Path) -> Result<(PathBuf, tokio::fs::File)> {
+    let base = dest.file_name().expect("checked by the caller").to_owned();
+    for _ in 0..8 {
+        let mut nonce = [0u8; 8];
+        getrandom::getrandom(&mut nonce).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
+        let mut name = base.clone();
+        name.push(format!(".egdod-part.{}", hex(&nonce)));
+        let tmp = dest.with_file_name(name);
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .await
+        {
+            Ok(f) => return Ok((tmp, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("creating {}", tmp.display())),
+        }
+    }
+    bail!("could not create a staging file next to {}", dest.display())
 }
 
-#[cfg(unix)]
 async fn set_mode(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
         .await
         .with_context(|| format!("setting mode on {}", path.display()))
-}
-
-#[cfg(not(unix))]
-async fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
-    Ok(())
 }
 
 pub fn hex(bytes: &[u8]) -> String {
@@ -398,7 +417,26 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("sha256 mismatch"), "{err}");
         assert!(!dest.exists());
-        assert!(!temp_path(&dest).exists());
+        // No staging file left behind either.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[tokio::test]
+    async fn overlong_transfer_is_cut_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("dest.bin");
+        let (mut w, mut r) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            // Announced 4 bytes, sends far more: the receiver must not write it all.
+            let _ = w.write_all(&vec![0u8; 1 << 20]).await;
+            let _ = finish(&mut w).await;
+        });
+        let err = recv_file_body(&mut r, &dest, 4, [0u8; 32], 0o644)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("more than the announced"), "{err}");
+        assert!(!dest.exists());
     }
 
     #[tokio::test]

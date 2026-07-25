@@ -7,6 +7,7 @@
 //! proved possession of that key by the time a connection exists.
 
 use crate::net::{self, RelayChoice};
+use crate::state::load_or_create_key;
 use crate::pipe::splice;
 use crate::proto::{
     read_msg, recv_file_body, send_file_body, stat_and_hash, write_msg, Ack, ExecFrame,
@@ -14,9 +15,9 @@ use crate::proto::{
 };
 use anyhow::{Context, Result};
 use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream};
-use iroh::{EndpointId, RelayUrl, SecretKey};
+use iroh::{EndpointId, SecretKey};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -34,7 +35,6 @@ pub struct Config {
     pub controller: EndpointId,
     pub key_file: PathBuf,
     pub relay: RelayChoice,
-    pub relay_url: Option<RelayUrl>,
     pub direct: Vec<SocketAddr>,
 }
 
@@ -48,6 +48,9 @@ enum Outcome {
 /// Never returns. A target has no screen and nobody to press a key on it, so
 /// every failure here is a sleep and another attempt.
 pub async fn run(cfg: Config) -> Result<()> {
+    // The agent keeps this across reboots so an approved target stays approved; on
+    // a tmpfs initramfs it is regenerated per boot and needs approving again, which
+    // is a property of the medium, not of this code.
     let secret = load_or_create_key(&cfg.key_file)?;
     // stdout, not a log line: on a bare target this print is how the operator
     // learns which key to approve, e.g. from a serial console capture.
@@ -86,15 +89,19 @@ async fn session(secret: &SecretKey, cfg: &Config) -> Result<Outcome> {
     // No resolving either when it was told exactly where to dial, which is what
     // makes a DNS-free target possible (`--direct`, plus an IP-literal `--relay`).
     let lookup = if cfg.direct.is_empty() {
-        net::Lookup::RESOLVE
+        net::Lookup::Resolve
     } else {
-        net::Lookup::NONE
+        net::Lookup::None
     };
     let ep = net::bind(Some(secret.clone()), &cfg.relay, lookup, None).await?;
-    let addr = net::endpoint_addr(cfg.controller, &cfg.direct, cfg.relay_url.as_ref());
+    let addr = net::endpoint_addr(cfg.controller, &cfg.direct, cfg.relay.first_url()?.as_ref());
     let connected = tokio::time::timeout(CONNECT_TIMEOUT, ep.connect(addr, ALPN)).await;
     let outcome = match connected {
         Err(_) => Err(anyhow::anyhow!("connect timed out after {CONNECT_TIMEOUT:?}")),
+        // The controller can close before we ever accept a stream, so "not
+        // approved" has to be recognised here too or the target loses the only
+        // signal it can log about why it is getting nowhere.
+        Ok(Err(e)) if closed_as_pending(&e) => Ok(Outcome::Pending),
         Ok(Err(e)) => Err(anyhow::Error::new(e).context("dialling controller")),
         Ok(Ok(conn)) => {
             let (path, remote) = net::session_path_report(&conn);
@@ -118,17 +125,29 @@ async fn serve_connection(conn: Connection) -> Outcome {
                     }
                 });
             }
-            Err(ConnectionError::ApplicationClosed(close))
-                if u64::from(close.error_code) == u64::from(CLOSE_PENDING) =>
-            {
-                return Outcome::Pending;
-            }
+            Err(e) if is_pending_close(&e) => return Outcome::Pending,
             Err(e) => {
                 tracing::debug!("connection closed: {e}");
                 return Outcome::Ended;
             }
         }
     }
+}
+
+fn is_pending_close(e: &ConnectionError) -> bool {
+    matches!(e, ConnectionError::ApplicationClosed(close)
+        if u64::from(close.error_code) == u64::from(CLOSE_PENDING))
+}
+
+fn closed_as_pending(e: &iroh::endpoint::ConnectError) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = source {
+        if let Some(ce) = err.downcast_ref::<ConnectionError>() {
+            return is_pending_close(ce);
+        }
+        source = err.source();
+    }
+    false
 }
 
 async fn handle(mut send: SendStream, mut recv: RecvStream) -> Result<()> {
@@ -236,8 +255,11 @@ async fn exec(argv: Vec<String>, mut send: SendStream) -> Result<()> {
     });
 
     let status = child.wait().await.context("waiting for child")?;
-    let _ = out.await;
-    let _ = err.await;
+    // Bounded: a command that forks a process holding the same pipes would
+    // otherwise keep them open forever, and the exit status would never arrive.
+    let drain = Duration::from_secs(2);
+    let _ = tokio::time::timeout(drain, out).await;
+    let _ = tokio::time::timeout(drain, err).await;
     if let Ok(Some(mut send)) = writer.await {
         write_msg(&mut send, &ExecFrame::Exit(exit_code(&status))).await?;
         send.finish()?;
@@ -269,7 +291,6 @@ async fn pump_frames<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
-#[cfg(unix)]
 fn exit_code(status: &std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     status
@@ -277,52 +298,6 @@ fn exit_code(status: &std::process::ExitStatus) -> i32 {
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
 }
 
-#[cfg(not(unix))]
-fn exit_code(status: &std::process::ExitStatus) -> i32 {
-    status.code().unwrap_or(-1)
-}
-
-/// The agent's identity. Persisted so that a target keeps the same approved key
-/// across reboots; on a tmpfs initramfs it is regenerated per boot and needs
-/// approving again, which is a property of the medium, not of this code.
-pub fn load_or_create_key(path: &Path) -> Result<SecretKey> {
-    if let Ok(bytes) = std::fs::read(path) {
-        let arr: [u8; 32] = bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("key file {} is not 32 bytes", path.display()))?;
-        return Ok(SecretKey::from_bytes(&arr));
-    }
-    let mut arr = [0u8; 32];
-    getrandom::getrandom(&mut arr).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-    }
-    write_private(path, &arr)?;
-    Ok(SecretKey::from_bytes(&arr))
-}
-
-#[cfg(unix)]
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("creating {}", path.display()))?;
-    f.write_all(bytes).context("writing key")?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
-}
 
 #[cfg(test)]
 mod tests {

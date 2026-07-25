@@ -42,6 +42,18 @@ impl RelayChoice {
     pub fn enabled(&self) -> bool {
         !matches!(self, RelayChoice::Disabled)
     }
+
+    /// The relay to name in a dial address, so a target with no DNS can be told
+    /// where the controller is reachable without looking anything up.
+    pub fn first_url(&self) -> Result<Option<RelayUrl>> {
+        match self {
+            RelayChoice::Urls(urls) => match urls.first() {
+                Some(u) => Ok(Some(u.parse().map_err(|e| anyhow::anyhow!("parsing relay url {u}: {e}"))?)),
+                None => Ok(None),
+            },
+            _ => Ok(None),
+        }
+    }
 }
 
 /// How an endpoint participates in n0's DNS-based address lookup.
@@ -51,24 +63,13 @@ impl RelayChoice {
 /// never publish (a target should leave no record of itself) and need not
 /// resolve at all when it was given `--direct`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Lookup {
-    pub publish: bool,
-    pub resolve: bool,
-}
-
-impl Lookup {
-    pub const NONE: Lookup = Lookup {
-        publish: false,
-        resolve: false,
-    };
-    pub const RESOLVE: Lookup = Lookup {
-        publish: false,
-        resolve: true,
-    };
-    pub const BOTH: Lookup = Lookup {
-        publish: true,
-        resolve: true,
-    };
+pub enum Lookup {
+    /// Neither: everything the endpoint needs was given on the command line.
+    None,
+    /// Resolve only — the agent looks the controller up but leaves no record.
+    Resolve,
+    /// Publish and resolve, which only the controller needs.
+    Both,
 }
 
 /// `bind_addr` pins the UDP socket. A controller that keeps its port across
@@ -90,10 +91,10 @@ pub async fn bind(
     if let Some(secret) = secret {
         b = b.secret_key(secret);
     }
-    if lookup.publish {
+    if lookup == Lookup::Both {
         b = b.address_lookup(PkarrPublisher::n0_dns());
     }
-    if lookup.resolve {
+    if lookup != Lookup::None {
         b = b.address_lookup(DnsAddressLookup::n0_dns());
     }
     let ep = b.bind().await.context("binding iroh endpoint")?;
@@ -149,9 +150,11 @@ pub fn describe(addr: &TransportAddr) -> String {
 /// that is what gets reported. `None` only while no path is open at all, which a
 /// live connection does not stay in.
 pub fn session_path(conn: &Connection) -> Option<(PathKind, String)> {
+    // Only the selected path: with a relay path and a candidate direct path both
+    // open, picking an arbitrary one would report "direct" for traffic that is
+    // still going through the relay.
     let paths = conn.paths();
-    let selected = paths.iter().find(|p| p.is_selected());
-    let path = selected.or_else(|| paths.iter().next())?;
+    let path = paths.iter().find(|p| p.is_selected())?;
     let addr = path.remote_addr();
     Some((classify(addr), describe(addr)))
 }
@@ -202,8 +205,8 @@ pub async fn probe(
     timeout: Duration,
 ) -> Result<PathKind> {
     let lookup = match mode {
-        ProbeMode::Discovery => Lookup::RESOLVE,
-        ProbeMode::Direct => Lookup::NONE,
+        ProbeMode::Discovery => Lookup::Resolve,
+        ProbeMode::Direct => Lookup::None,
     };
     let ep = bind(None, relay, lookup, None).await?;
     let addr = match mode {

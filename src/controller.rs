@@ -11,7 +11,7 @@ use crate::pipe::splice;
 use crate::proto::{
     finish, hex, read_msg, read_msg_opt, recv_file_body, send_file_body, stat_and_hash, write_msg,
     Ack, ExecFrame, PullStart, Request, Route, RouteReply, ALPN, CLOSE_PENDING,
-    PROBE_ALPN, PROBE_PONG,
+    PROBE_ALPN, PROBE_PING, PROBE_PONG,
 };
 use crate::state::{now_unix, SessionInfo, StateDir, Status};
 use anyhow::{bail, Context, Result};
@@ -20,7 +20,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::EndpointId;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -43,6 +43,9 @@ pub struct ServeConfig {
 #[derive(Clone)]
 struct Session {
     conn: Connection,
+    /// Distinguishes two connections from the same agent key, which is what a
+    /// redial after an unnoticed drop produces.
+    id: usize,
     since: u64,
 }
 
@@ -67,13 +70,19 @@ impl StatusFile {
 }
 
 pub async fn serve(cfg: ServeConfig) -> Result<()> {
+    cfg.state.ensure()?;
     let secret = cfg.state.load_key()?;
     let node_id = secret.public();
-    cfg.state.ensure()?;
 
     let sock = cfg.state.sock_path();
-    // A stale socket from a killed controller must not block the next one; the
-    // state dir is 0700, so nobody else can have planted this file.
+    // Two controllers sharing one state directory would share one identity and
+    // fight over the socket, so the live one is asked first whether it is alive.
+    if UnixStream::connect(&sock).await.is_ok() {
+        bail!(
+            "another controller is already serving {}",
+            cfg.state.root().display()
+        );
+    }
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock)
         .with_context(|| format!("binding control socket {}", sock.display()))?;
@@ -89,7 +98,6 @@ pub async fn serve(cfg: ServeConfig) -> Result<()> {
             node_id: node_id.to_string(),
             pid: std::process::id(),
             updated_unix: now_unix(),
-            relay_enabled: cfg.relay.enabled(),
             direct_addrs: Vec::new(),
             dialable: None,
             probe_mode,
@@ -107,7 +115,17 @@ pub async fn serve(cfg: ServeConfig) -> Result<()> {
     println!("state dir: {}", cfg.state.root().display());
 
     loop {
-        let ep = net::bind(Some(secret.clone()), &cfg.relay, Lookup::BOTH, cfg.bind_addr).await?;
+        // A rebind can fail exactly when the restart is most needed (the network
+        // went away), so it retries instead of taking the controller down with it.
+        let ep = loop {
+            match net::bind(Some(secret.clone()), &cfg.relay, Lookup::Both, cfg.bind_addr).await {
+                Ok(ep) => break ep,
+                Err(e) => {
+                    tracing::error!("cannot bind an endpoint: {e:#}");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        };
         let addrs: Vec<SocketAddr> = ep.addr().ip_addrs().copied().collect();
         status
             .update(|s| s.direct_addrs = addrs.iter().map(|a| a.to_string()).collect())
@@ -176,11 +194,13 @@ impl ProtocolHandler for ProbeResponder {
     /// has to look like a stranger to be worth anything, and the answer is a
     /// constant that reveals nothing the dialer did not already know.
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        if let Ok((mut send, _recv)) = conn.accept_bi().await {
-            let _ = send.write_all(PROBE_PONG).await;
-            let _ = send.finish();
-            // The dialer reads to EOF; give it a moment before the connection goes.
-            let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+        if let Ok((mut send, mut recv)) = conn.accept_bi().await {
+            if recv.read_to_end(PROBE_PING.len()).await.as_deref() == Ok(PROBE_PING) {
+                let _ = send.write_all(PROBE_PONG).await;
+                let _ = send.finish();
+                // The dialer reads to EOF; give it a moment before the connection goes.
+                let _ = tokio::time::timeout(Duration::from_secs(1), conn.closed()).await;
+            }
         }
         Ok(())
     }
@@ -220,12 +240,13 @@ impl ProtocolHandler for Acceptor {
 
         let (path, remote) = net::session_path_report(&conn);
         tracing::info!(agent = %peer, %path, %remote, "agent connected");
-        let since = now_unix();
+        let id = conn.stable_id();
         self.sessions.lock().await.insert(
             peer,
             Session {
                 conn: conn.clone(),
-                since,
+                id,
+                since: now_unix(),
             },
         );
         publish_sessions(&self.sessions, &self.status).await;
@@ -234,7 +255,18 @@ impl ProtocolHandler for Acceptor {
         let status = self.status.clone();
         tokio::spawn(async move {
             conn.closed().await;
-            sessions.lock().await.remove(&peer);
+            {
+                // An agent that redialled before we noticed this connection die
+                // already holds the slot; forgetting by key alone would evict the
+                // live session and leave a connected agent unreachable.
+                let mut map = sessions.lock().await;
+                match map.get(&peer) {
+                    Some(s) if s.id == id => {
+                        map.remove(&peer);
+                    }
+                    _ => return,
+                }
+            }
             publish_sessions(&sessions, &status).await;
             tracing::info!(agent = %peer, "agent disconnected");
         });
@@ -420,29 +452,52 @@ async fn route(state: &StateDir, agent: &str) -> Result<Routed> {
     }
 }
 
-/// Returns the target's exit status so the caller can exit with it.
-pub async fn exec(state: &StateDir, agent: &str, argv: Vec<String>) -> Result<i32> {
+/// Runs argv on the target, writing its output to `out` and `err` as it arrives,
+/// and returns the target's exit status.
+///
+/// The command and the ssh recipe share this one implementation; they differ only
+/// in the sinks they hand it (a terminal, or a buffer).
+pub async fn exec_into<O, E>(
+    state: &StateDir,
+    agent: &str,
+    argv: Vec<String>,
+    out: &mut O,
+    err: &mut E,
+) -> Result<i32>
+where
+    O: tokio::io::AsyncWrite + Unpin,
+    E: tokio::io::AsyncWrite + Unpin,
+{
     let mut r = route(state, agent).await?;
     write_msg(&mut r.write, &Request::Exec { argv }).await?;
     finish(&mut r.write).await?;
-
-    let mut stdout = tokio::io::stdout();
-    let mut stderr = tokio::io::stderr();
     let mut code = None;
     while let Some(frame) = read_msg_opt::<_, ExecFrame>(&mut r.read).await? {
         match frame {
-            ExecFrame::Stdout(b) => stdout.write_all(&b).await?,
-            ExecFrame::Stderr(b) => stderr.write_all(&b).await?,
+            ExecFrame::Stdout(b) => out.write_all(&b).await?,
+            ExecFrame::Stderr(b) => err.write_all(&b).await?,
             ExecFrame::Exit(c) => code = Some(c),
             ExecFrame::Failed(e) => bail!("exec failed on the target: {e}"),
         }
     }
-    stdout.flush().await?;
-    stderr.flush().await?;
+    out.flush().await?;
+    err.flush().await?;
     code.context("agent closed the stream without reporting an exit status")
 }
 
-pub async fn push(state: &StateDir, agent: &str, local: &Path, remote: &str) -> Result<()> {
+/// Returns the target's exit status so the caller can exit with it.
+pub async fn exec(state: &StateDir, agent: &str, argv: Vec<String>) -> Result<i32> {
+    let (mut out, mut err) = (tokio::io::stdout(), tokio::io::stderr());
+    exec_into(state, agent, argv, &mut out, &mut err).await
+}
+
+/// Sends a local file, returning what the target now holds.
+pub async fn push_file(
+    state: &StateDir,
+    agent: &str,
+    local: &Path,
+    remote: &str,
+) -> Result<(u64, [u8; 32])> {
     let (mode, len, sha256) = stat_and_hash(local).await?;
     let mut r = route(state, agent).await?;
     write_msg(
@@ -458,15 +513,35 @@ pub async fn push(state: &StateDir, agent: &str, local: &Path, remote: &str) -> 
     send_file_body(&mut r.write, local).await?;
     finish(&mut r.write).await?;
     match read_msg::<_, Ack>(&mut r.read).await? {
-        Ack::Ok => {
-            println!("pushed {} -> {remote} ({len} bytes, sha256 {})", local.display(), hex(&sha256));
-            Ok(())
-        }
+        Ack::Ok => Ok((len, sha256)),
         Ack::Err(e) => bail!("agent rejected the file: {e}"),
     }
 }
 
-pub async fn pull(state: &StateDir, agent: &str, remote: &str, local: &Path) -> Result<()> {
+pub async fn push(state: &StateDir, agent: &str, local: &Path, remote: &str) -> Result<()> {
+    let (len, sha256) = push_file(state, agent, local, remote).await?;
+    println!(
+        "pushed {} -> {remote} ({len} bytes, sha256 {})",
+        local.display(),
+        hex(&sha256)
+    );
+    Ok(())
+}
+
+/// What a `pull` found. The distinction is load-bearing: the ssh recipe treats a
+/// missing file as "nothing installed yet", and must not treat a dropped link as
+/// the same thing and then overwrite what is really there.
+pub enum Pulled {
+    Fetched { len: u64, sha256: [u8; 32] },
+    Missing(String),
+}
+
+pub async fn pull_file(
+    state: &StateDir,
+    agent: &str,
+    remote: &str,
+    local: &Path,
+) -> Result<Pulled> {
     let mut r = route(state, agent).await?;
     write_msg(
         &mut r.write,
@@ -477,9 +552,18 @@ pub async fn pull(state: &StateDir, agent: &str, remote: &str, local: &Path) -> 
     .await?;
     finish(&mut r.write).await?;
     match read_msg::<_, PullStart>(&mut r.read).await? {
-        PullStart::Err(e) => bail!("agent could not send {remote}: {e}"),
+        PullStart::Err(e) => Ok(Pulled::Missing(e)),
         PullStart::Ok { mode, len, sha256 } => {
             recv_file_body(&mut r.read, local, len, sha256, mode).await?;
+            Ok(Pulled::Fetched { len, sha256 })
+        }
+    }
+}
+
+pub async fn pull(state: &StateDir, agent: &str, remote: &str, local: &Path) -> Result<()> {
+    match pull_file(state, agent, remote, local).await? {
+        Pulled::Missing(e) => bail!("agent could not send {remote}: {e}"),
+        Pulled::Fetched { len, sha256 } => {
             println!(
                 "pulled {remote} -> {} ({len} bytes, sha256 {})",
                 local.display(),
@@ -490,9 +574,9 @@ pub async fn pull(state: &StateDir, agent: &str, remote: &str, local: &Path) -> 
     }
 }
 
-/// Binds the local listener and serves it until the returned handle is dropped.
-/// Split out from the `forward` command because the ssh recipe needs exactly this
-/// and must not reimplement it.
+/// Binds the local listener and serves it until the returned handle is aborted.
+/// The ssh recipe uses this directly, so the recipe really is the `forward`
+/// primitive rather than a second implementation of it.
 pub async fn forward_listener(
     state: &StateDir,
     agent: &str,
@@ -510,7 +594,10 @@ pub async fn forward_listener(
             let (tcp, _peer) = match listener.accept().await {
                 Ok(v) => v,
                 Err(e) => {
+                    // A listener error is usually resource exhaustion; retrying
+                    // flat out would spin a CPU on a controller that may be a phone.
                     tracing::warn!("accept failed: {e}");
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                     continue;
                 }
             };
@@ -615,9 +702,8 @@ pub fn status(state: &StateDir, json: bool) -> Result<()> {
         match s.dialable {
             Some(true) => "yes".to_string(),
             Some(false) => format!(
-                "NO — {} (consecutive failures: {})",
-                s.last_probe_error.as_deref().unwrap_or("unknown"),
-                s.consecutive_probe_failures
+                "NO — {}",
+                s.last_probe_error.as_deref().unwrap_or("unknown")
             ),
             None => "not probed yet".to_string(),
         }
@@ -630,6 +716,9 @@ pub fn status(state: &StateDir, json: bool) -> Result<()> {
             .unwrap_or_else(|| "never".into())
     );
     println!("restarts:  {}", s.endpoint_restarts);
+    if !s.writer_alive() {
+        println!("WARNING:   the controller that wrote this (pid {}) is gone; everything above is its last opinion, not the current one", s.pid);
+    }
     for sess in &s.sessions {
         println!("agent:     {} via {} ({})", sess.agent, sess.path, sess.remote);
     }
@@ -639,79 +728,40 @@ pub fn status(state: &StateDir, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Where the ssh recipe keeps the key and known_hosts it manufactures.
-pub fn ssh_paths(state: &StateDir) -> (PathBuf, PathBuf, PathBuf) {
-    let dir = state.ssh_dir();
-    (
-        dir.join("id_ed25519"),
-        dir.join("id_ed25519.pub"),
-        dir.join("known_hosts"),
-    )
-}
-
-/// Convenience for the ssh recipe: run a command and collect its output rather
-/// than streaming it to the terminal.
+/// Runs argv on the target and collects its output instead of streaming it to a
+/// terminal. Used by the ssh recipe, whose steps are decisions, not output.
 pub async fn exec_capture(
     state: &StateDir,
     agent: &str,
     argv: Vec<String>,
 ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
-    let mut r = route(state, agent).await?;
-    write_msg(&mut r.write, &Request::Exec { argv }).await?;
-    finish(&mut r.write).await?;
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    let mut code = None;
-    while let Some(frame) = read_msg_opt::<_, ExecFrame>(&mut r.read).await? {
-        match frame {
-            ExecFrame::Stdout(b) => out.extend_from_slice(&b),
-            ExecFrame::Stderr(b) => err.extend_from_slice(&b),
-            ExecFrame::Exit(c) => code = Some(c),
-            ExecFrame::Failed(e) => bail!("exec failed on the target: {e}"),
-        }
-    }
-    Ok((code.unwrap_or(-1), out, err))
+    let code = exec_into(state, agent, argv, &mut out, &mut err).await?;
+    Ok((code, out, err))
 }
 
-/// Pull a file into memory, via `scratch` because the copy primitive verifies a
-/// digest against a written file rather than against a buffer. Used by the ssh
-/// recipe for host keys and authorized_keys, both small by construction.
+/// Pulls a small file into memory, staging it through `scratch` because the copy
+/// primitive verifies the digest against a written file rather than a buffer.
 ///
-/// `Ok(None)` means the target does not have the file — an expected case for
-/// both of those, not an error.
+/// `Ok(None)` means the target does not have the file, and nothing else: a
+/// transport failure is an error, because the ssh recipe rewrites what it reads.
 pub async fn pull_bytes(
     state: &StateDir,
     agent: &str,
     remote: &str,
     scratch: &Path,
 ) -> Result<Option<Vec<u8>>> {
-    match pull_quiet(state, agent, remote, scratch).await {
-        Ok(()) => Ok(Some(tokio::fs::read(scratch).await?)),
-        Err(e) => {
-            tracing::debug!("pull {remote}: {e:#}");
+    match pull_file(state, agent, remote, scratch).await? {
+        Pulled::Missing(e) => {
+            tracing::debug!("pull {remote}: {e}");
             Ok(None)
         }
+        Pulled::Fetched { .. } => Ok(Some(tokio::fs::read(scratch).await?)),
     }
 }
 
-async fn pull_quiet(state: &StateDir, agent: &str, remote: &str, local: &Path) -> Result<()> {
-    let mut r = route(state, agent).await?;
-    write_msg(
-        &mut r.write,
-        &Request::Pull {
-            path: remote.to_string(),
-        },
-    )
-    .await?;
-    finish(&mut r.write).await?;
-    match read_msg::<_, PullStart>(&mut r.read).await? {
-        PullStart::Err(e) => bail!("{e}"),
-        PullStart::Ok { mode, len, sha256 } => {
-            recv_file_body(&mut r.read, local, len, sha256, mode).await
-        }
-    }
-}
-
-/// Push bytes that were produced locally rather than read from a file.
+/// Pushes bytes produced locally rather than read from a file, staging them
+/// through `scratch` so this is the same copy primitive and not a second one.
 pub async fn push_bytes(
     state: &StateDir,
     agent: &str,
@@ -721,27 +771,14 @@ pub async fn push_bytes(
     scratch: &Path,
 ) -> Result<()> {
     tokio::fs::write(scratch, body).await?;
-    let mut r = route(state, agent).await?;
-    let sha256: [u8; 32] = {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(body);
-        h.finalize().into()
-    };
-    write_msg(
-        &mut r.write,
-        &Request::Push {
-            path: remote.to_string(),
-            mode,
-            len: body.len() as u64,
-            sha256,
-        },
-    )
-    .await?;
-    send_file_body(&mut r.write, scratch).await?;
-    finish(&mut r.write).await?;
-    match read_msg::<_, Ack>(&mut r.read).await? {
-        Ack::Ok => Ok(()),
-        Ack::Err(e) => bail!("agent rejected the file: {e}"),
-    }
+    set_mode(scratch, mode).await?;
+    push_file(state, agent, scratch, remote).await?;
+    Ok(())
+}
+
+async fn set_mode(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .await
+        .with_context(|| format!("setting mode on {}", path.display()))
 }

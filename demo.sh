@@ -196,6 +196,20 @@ else
   echo "skipped: no passwordless sudo here"
 fi
 
+say "12b. what the controller does when it CANNOT be dialled"
+# Forced, not simulated away: a zero-length probe deadline makes every canary
+# fail, which is the same code path as a controller that has published itself
+# and is nevertheless unreachable. Separate state dir so the real one is untouched.
+UND=$DEMO/undialable
+"$BIN" controller --state-dir "$UND" init >/dev/null
+"$BIN" controller --state-dir "$UND" serve --no-relay --bind 127.0.0.1:0 \
+  --probe-interval 1 --probe-timeout 0 --restart-after 2 >"$DEMO/undialable.log" 2>&1 &
+PIDS+=($!)
+wait_for 60 "[ -s '$UND/status.json' ] && grep -q '\"endpoint_restarts\": 1' '$UND/status.json'"
+grep -m3 -E "UNDIALABLE|rebuilding" "$DEMO/undialable.log"
+"$BIN" controller --state-dir "$UND" status
+kill "${PIDS[-1]}" 2>/dev/null || true
+
 say "13. final controller status"
 ctl status --json
 

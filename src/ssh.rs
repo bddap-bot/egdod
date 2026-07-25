@@ -32,14 +32,20 @@ pub struct Config {
 }
 
 pub async fn run(state: &StateDir, cfg: Config) -> Result<i32> {
-    let (key, pubkey, known_hosts) = controller::ssh_paths(state);
+    let (key, pubkey, known_hosts) = (
+        state.ssh_key_path(),
+        state.ssh_pub_path(),
+        state.known_hosts_path(),
+    );
     std::fs::create_dir_all(state.ssh_dir())?;
     ensure_local_key(&key)?;
     let pubkey_line = std::fs::read_to_string(&pubkey)
         .with_context(|| format!("reading {}", pubkey.display()))?
         .trim()
         .to_string();
-    let scratch = state.ssh_dir().join("scratch");
+    // Per-process, so two concurrent `ssh` runs against one state dir cannot
+    // stage over each other.
+    let scratch = state.ssh_dir().join(format!("scratch.{}", std::process::id()));
 
     install_authorized_key(state, &cfg, &pubkey_line, &scratch).await?;
     let host_key = fetch_host_key(state, &cfg, &scratch).await?;
@@ -56,8 +62,15 @@ pub async fn run(state: &StateDir, cfg: Config) -> Result<i32> {
     ensure_sshd(state, &cfg, bound).await?;
 
     // known_hosts is keyed by the forwarded port, which changes per invocation,
-    // so it is rewritten rather than appended to.
-    let entry = format!("[{}]:{} {}\n", bound.ip(), bound.port(), host_key);
+    // so it is rewritten rather than appended to. ssh only looks up the bracketed
+    // form for a non-default port, so port 22 must be written bare or the lookup
+    // misses and StrictHostKeyChecking refuses the connection.
+    let host = if bound.port() == 22 {
+        bound.ip().to_string()
+    } else {
+        format!("[{}]:{}", bound.ip(), bound.port())
+    };
+    let entry = format!("{host} {host_key}\n");
     std::fs::write(&known_hosts, &entry)
         .with_context(|| format!("writing {}", known_hosts.display()))?;
     eprintln!("egdod: known_hosts entry from the authenticated channel: {}", entry.trim());
@@ -81,6 +94,7 @@ pub async fn run(state: &StateDir, cfg: Config) -> Result<i32> {
         .await
         .context("running ssh (is an ssh client installed on the controller?)")?;
     forwarder.abort();
+    let _ = std::fs::remove_file(&scratch);
     Ok(status.code().unwrap_or(255))
 }
 

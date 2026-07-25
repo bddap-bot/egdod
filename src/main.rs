@@ -121,10 +121,10 @@ enum ControllerCmd {
         #[arg(long, default_value = "/etc/ssh/ssh_host_ed25519_key.pub")]
         host_key: String,
         /// argv used to start sshd on the target, repeat once per word.
-        #[arg(long = "sshd-arg", allow_hyphen_values = true)]
+        #[arg(long = "sshd-arg", allow_hyphen_values = true, default_values = ["sshd"])]
         sshd_arg: Vec<String>,
         /// argv used to generate host keys on the target, repeat once per word.
-        #[arg(long = "keygen-arg", allow_hyphen_values = true)]
+        #[arg(long = "keygen-arg", allow_hyphen_values = true, default_values = ["ssh-keygen", "-A"])]
         keygen_arg: Vec<String>,
         /// The target's sshd address, as seen from the target.
         #[arg(long, default_value = "127.0.0.1:22")]
@@ -155,17 +155,10 @@ async fn main() -> Result<()> {
         Role::Agent(a) => {
             let controller = parse_pubkey(&a.controller).context("--controller")?;
             let relay = RelayChoice::from_flags(a.no_relay, &a.relay);
-            let relay_url = a
-                .relay
-                .first()
-                .map(|u| u.parse())
-                .transpose()
-                .map_err(|e| anyhow::anyhow!("parsing --relay url: {e}"))?;
             agent::run(agent::Config {
                 controller,
                 key_file: a.key_file,
                 relay,
-                relay_url,
                 direct: a.direct,
             })
             .await
@@ -236,8 +229,8 @@ async fn run_controller(state: StateDir, cmd: ControllerCmd) -> Result<()> {
                 user,
                 authorized_keys,
                 host_key_pub: host_key,
-                sshd_argv: default_argv(sshd_arg, &["sshd"]),
-                keygen_argv: default_argv(keygen_arg, &["ssh-keygen", "-A"]),
+                sshd_argv: sshd_arg,
+                keygen_argv: keygen_arg,
                 target_addr,
                 local_port,
                 ssh_argv,
@@ -245,13 +238,5 @@ async fn run_controller(state: StateDir, cmd: ControllerCmd) -> Result<()> {
             let code = ssh::run(&state, cfg).await?;
             std::process::exit(code);
         }
-    }
-}
-
-fn default_argv(given: Vec<String>, fallback: &[&str]) -> Vec<String> {
-    if given.is_empty() {
-        fallback.iter().map(|s| s.to_string()).collect()
-    } else {
-        given
     }
 }
