@@ -7,7 +7,7 @@
 //! proved possession of that key by the time a connection exists.
 
 use crate::net::{self, RelayChoice};
-use crate::state::load_or_create_key;
+use crate::state::{load_or_create_key, OnUnusable};
 use crate::pipe::splice;
 use crate::proto::{
     read_msg, recv_file_body, send_file_body, stat_and_hash, write_msg, Ack, ExecFrame,
@@ -51,7 +51,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     // The agent keeps this across reboots so an approved target stays approved; on
     // a tmpfs initramfs it is regenerated per boot and needs approving again, which
     // is a property of the medium, not of this code.
-    let secret = load_or_create_key(&cfg.key_file)?;
+    let secret = load_or_create_key(&cfg.key_file, OnUnusable::Replace)?;
     // stdout, not a log line: on a bare target this print is how the operator
     // learns which key to approve, e.g. from a serial console capture.
     println!("agent pubkey: {}", secret.public());
@@ -177,7 +177,11 @@ async fn handle(mut send: SendStream, mut recv: RecvStream) -> Result<()> {
             let src = PathBuf::from(&path);
             match stat_and_hash(&src).await {
                 Err(e) => {
-                    write_msg(&mut send, &PullStart::Err(format!("{e:#}"))).await?;
+                    let reply = match e.downcast_ref::<std::io::Error>() {
+                        Some(io) if io.kind() == std::io::ErrorKind::NotFound => PullStart::Missing,
+                        _ => PullStart::Err(format!("{e:#}")),
+                    };
+                    write_msg(&mut send, &reply).await?;
                     send.finish()?;
                     Ok(())
                 }
@@ -258,8 +262,13 @@ async fn exec(argv: Vec<String>, mut send: SendStream) -> Result<()> {
     // Bounded: a command that forks a process holding the same pipes would
     // otherwise keep them open forever, and the exit status would never arrive.
     let drain = Duration::from_secs(2);
-    let _ = tokio::time::timeout(drain, out).await;
-    let _ = tokio::time::timeout(drain, err).await;
+    // Aborted, not just abandoned: dropping the handle detaches the task, which
+    // would keep its channel sender alive and the writer waiting forever.
+    for mut task in [out, err] {
+        if tokio::time::timeout(drain, &mut task).await.is_err() {
+            task.abort();
+        }
+    }
     if let Ok(Some(mut send)) = writer.await {
         write_msg(&mut send, &ExecFrame::Exit(exit_code(&status))).await?;
         send.finish()?;
@@ -307,8 +316,8 @@ mod tests {
     fn agent_key_is_stable_across_runs() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested/agent.key");
-        let a = load_or_create_key(&path).unwrap();
-        let b = load_or_create_key(&path).unwrap();
+        let a = load_or_create_key(&path, OnUnusable::Replace).unwrap();
+        let b = load_or_create_key(&path, OnUnusable::Replace).unwrap();
         assert_eq!(a.public(), b.public());
     }
 }

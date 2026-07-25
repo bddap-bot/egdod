@@ -70,6 +70,10 @@ pub enum Ack {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum PullStart {
     Ok { mode: u32, len: u64, sha256: [u8; 32] },
+    /// The path is not there. Kept distinct from every other failure because a
+    /// caller that reads-modifies-writes a remote file (the ssh recipe and its
+    /// authorized_keys) must not treat "I could not read it" as "it is empty".
+    Missing,
     Err(String),
 }
 
@@ -271,7 +275,10 @@ where
             break Err(anyhow::Error::from(e).context("writing file body"));
         }
     };
-    let flushed = out.sync_all().await;
+    // flush before sync: tokio stashes a failed write and only surfaces it from
+    // flush, so syncing alone would let a short file pass verification (the digest
+    // is computed over what arrived, not over what landed).
+    let flushed = async { out.flush().await?; out.sync_all().await }.await;
     drop(out);
     let verdict = (|| {
         outcome?;
@@ -285,11 +292,17 @@ where
         let _ = tokio::fs::remove_file(&tmp).await;
         return verdict;
     }
-    set_mode(&tmp, mode).await?;
-    tokio::fs::rename(&tmp, dest)
-        .await
-        .with_context(|| format!("renaming into {}", dest.display()))?;
-    Ok(())
+    let landed = async {
+        set_mode(&tmp, mode).await?;
+        tokio::fs::rename(&tmp, dest)
+            .await
+            .with_context(|| format!("renaming into {}", dest.display()))
+    }
+    .await;
+    if landed.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    landed
 }
 
 /// Creates the staging file next to `dest`, refusing to open anything that
@@ -420,6 +433,18 @@ mod tests {
         // No staging file left behind either.
         let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// A caller that read-modify-writes a remote file must be able to tell "not
+    /// there" from "could not read it"; if these two ever collapse into one
+    /// variant, the ssh recipe starts overwriting keys it failed to read.
+    #[test]
+    fn missing_and_unreadable_are_distinct_replies() {
+        let missing = postcard::to_allocvec(&PullStart::Missing).unwrap();
+        let err = postcard::to_allocvec(&PullStart::Err("permission denied".into())).unwrap();
+        assert_ne!(missing, err);
+        let back: PullStart = postcard::from_bytes(&missing).unwrap();
+        assert_eq!(back, PullStart::Missing);
     }
 
     #[tokio::test]

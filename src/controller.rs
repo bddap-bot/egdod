@@ -114,18 +114,23 @@ pub async fn serve(cfg: ServeConfig) -> Result<()> {
     println!("controller node id: {node_id}");
     println!("state dir: {}", cfg.state.root().display());
 
+    let mut first = true;
     loop {
-        // A rebind can fail exactly when the restart is most needed (the network
-        // went away), so it retries instead of taking the controller down with it.
+        // The first bind must fail loudly — a bad --bind is a misconfiguration,
+        // and retrying it forever would leave commands hanging on a socket nobody
+        // is reading. A *re*bind fails exactly when the restart is most needed
+        // (the network went away), so that one retries.
         let ep = loop {
             match net::bind(Some(secret.clone()), &cfg.relay, Lookup::Both, cfg.bind_addr).await {
                 Ok(ep) => break ep,
+                Err(e) if first => return Err(e),
                 Err(e) => {
-                    tracing::error!("cannot bind an endpoint: {e:#}");
+                    tracing::error!("cannot rebind an endpoint: {e:#}");
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
         };
+        first = false;
         let addrs: Vec<SocketAddr> = ep.addr().ip_addrs().copied().collect();
         status
             .update(|s| s.direct_addrs = addrs.iter().map(|a| a.to_string()).collect())
@@ -528,12 +533,12 @@ pub async fn push(state: &StateDir, agent: &str, local: &Path, remote: &str) -> 
     Ok(())
 }
 
-/// What a `pull` found. The distinction is load-bearing: the ssh recipe treats a
-/// missing file as "nothing installed yet", and must not treat a dropped link as
-/// the same thing and then overwrite what is really there.
+/// What a `pull` found. `Missing` means the file is not there and nothing else:
+/// the ssh recipe rewrites what it reads, so "I could not read it" must never
+/// collapse into "it is empty".
 pub enum Pulled {
     Fetched { len: u64, sha256: [u8; 32] },
-    Missing(String),
+    Missing,
 }
 
 pub async fn pull_file(
@@ -552,7 +557,8 @@ pub async fn pull_file(
     .await?;
     finish(&mut r.write).await?;
     match read_msg::<_, PullStart>(&mut r.read).await? {
-        PullStart::Err(e) => Ok(Pulled::Missing(e)),
+        PullStart::Missing => Ok(Pulled::Missing),
+        PullStart::Err(e) => bail!("agent could not read {remote}: {e}"),
         PullStart::Ok { mode, len, sha256 } => {
             recv_file_body(&mut r.read, local, len, sha256, mode).await?;
             Ok(Pulled::Fetched { len, sha256 })
@@ -562,7 +568,7 @@ pub async fn pull_file(
 
 pub async fn pull(state: &StateDir, agent: &str, remote: &str, local: &Path) -> Result<()> {
     match pull_file(state, agent, remote, local).await? {
-        Pulled::Missing(e) => bail!("agent could not send {remote}: {e}"),
+        Pulled::Missing => bail!("the target has no {remote}"),
         Pulled::Fetched { len, sha256 } => {
             println!(
                 "pulled {remote} -> {} ({len} bytes, sha256 {})",
@@ -752,10 +758,7 @@ pub async fn pull_bytes(
     scratch: &Path,
 ) -> Result<Option<Vec<u8>>> {
     match pull_file(state, agent, remote, scratch).await? {
-        Pulled::Missing(e) => {
-            tracing::debug!("pull {remote}: {e}");
-            Ok(None)
-        }
+        Pulled::Missing => Ok(None),
         Pulled::Fetched { .. } => Ok(Some(tokio::fs::read(scratch).await?)),
     }
 }
