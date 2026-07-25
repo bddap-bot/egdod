@@ -341,7 +341,7 @@ async fn create_part_file(dest: &Path) -> Result<(PathBuf, tokio::fs::File)> {
     bail!("could not create a staging file next to {}", dest.display())
 }
 
-async fn set_mode(path: &Path, mode: u32) -> Result<()> {
+pub async fn set_mode(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
         .await

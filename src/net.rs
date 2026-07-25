@@ -2,6 +2,7 @@
 
 use crate::proto::{PathKind, PROBE_ALPN, PROBE_PING, PROBE_PONG};
 use anyhow::{ensure, Context, Result};
+use futures_lite::StreamExt;
 use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher};
 use iroh::endpoint::{presets, Connection};
 use iroh::{
@@ -162,6 +163,37 @@ pub fn session_path(conn: &Connection) -> Option<(PathKind, String)> {
 /// The one line every session must report, with no way to accidentally omit it.
 pub fn session_path_report(conn: &Connection) -> (PathKind, String) {
     session_path(conn).unwrap_or((PathKind::Unknown, "no open path".to_string()))
+}
+
+/// A change in the path a live session is transmitting on: `(was, now, remote)`.
+pub type PathChange = (PathKind, PathKind, String);
+
+/// Watches one connection and reports every change to its selected path until
+/// the connection ends.
+///
+/// A session that starts relayed and then holepunches would otherwise wear its
+/// first label for as long as it lives, which is the same "relayed connection
+/// reporting as direct" defect as classifying it wrongly in the first place —
+/// only slower to notice. Both roles need this, so there is one implementation
+/// of the detection; they differ only in what they do with a change.
+pub fn path_changes(conn: Connection) -> tokio::sync::mpsc::Receiver<PathChange> {
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    tokio::spawn(async move {
+        let mut events = std::pin::pin!(conn.path_events());
+        let mut last = session_path_report(&conn).0;
+        // The stream ends when the connection does, so this task cannot outlive
+        // the session it describes.
+        while events.next().await.is_some() {
+            let (now, remote) = session_path_report(&conn);
+            if now != last {
+                if tx.send((last, now, remote)).await.is_err() {
+                    return;
+                }
+                last = now;
+            }
+        }
+    });
+    rx
 }
 
 pub fn endpoint_addr(

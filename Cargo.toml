@@ -12,6 +12,8 @@ repository = "https://github.com/bddap-bot/egdod"
 
 [dependencies]
 iroh = "1"
+# Only for StreamExt over iroh's path-event stream; already in the tree via iroh.
+futures-lite = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "signal", "fs", "sync", "net", "time"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

@@ -134,6 +134,14 @@ async fn session(secret: &SecretKey, cfg: &Config) -> Result<Outcome> {
 }
 
 async fn serve_connection(conn: Connection) -> Outcome {
+    // The target has nobody to ask, so the log it leaves behind is the whole
+    // record of how it was talking to the controller.
+    let mut changes = net::path_changes(conn.clone());
+    tokio::spawn(async move {
+        while let Some((was, now, remote)) = changes.recv().await {
+            tracing::info!(%was, %now, %remote, "path changed");
+        }
+    });
     loop {
         match conn.accept_bi().await {
             Ok((send, recv)) => {

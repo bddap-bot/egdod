@@ -193,7 +193,7 @@ async fn run_controller(state: StateDir, cmd: ControllerCmd) -> Result<()> {
         }
         ControllerCmd::Pending { json } => controller::pending(&state, json),
         ControllerCmd::Approve { pubkey } => controller::approve(&state, &pubkey),
-        ControllerCmd::Status { json } => controller::status(&state, json),
+        ControllerCmd::Status { json } => std::process::exit(controller::status(&state, json)?),
         ControllerCmd::Exec { agent, argv } => {
             let code = controller::exec(&state, &agent, argv).await?;
             std::process::exit(code);
