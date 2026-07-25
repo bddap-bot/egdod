@@ -14,8 +14,8 @@ this repo has paid for that twice.
 
 ```
 nix-shell --run 'cargo test'
-nix-build musl.nix -o /tmp/egdod-musl                     # the static agent
-EGDOD_MUSL_BIN=/tmp/egdod-musl/bin/egdod nix-shell --run './demo.sh'
+nix-build musl.nix -o /tmp/egdod-musl-result                     # the static agent
+EGDOD_MUSL_BIN=/tmp/egdod-musl-result/bin/egdod nix-shell --run './demo.sh'
 ```
 
 `demo.sh` steps 0-14 are hermetic. Steps 15-17 use n0's public relay and DNS.
@@ -53,11 +53,19 @@ test controller_and_agent_over_iroh ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.49s
 ```
 
-`cargo clippy --all-targets` is clean. The integration test is a real iroh
+`cargo clippy --all-targets` emits nothing but its own progress:
+
+```
+    Checking egdod v0.1.0 (/home/bot/.cache/botq-wt/1703)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.47s
+```
+
+The integration test is a real iroh
 connection, not a mock: a controller serving, an agent dialling it by node id,
-the gate refusing all three primitives before approval and serving them after,
-a 5 MiB round trip, bytes through a forwarded port, and the session's own report
-of its path.
+the gate refusing exec, push, pull *and* a connection through a forward to a
+live listener before approval and serving them after, a 5 MiB round trip, a
+missing pull reported as missing and an unreadable one deliberately not, bytes
+through a forwarded port, and the session's own report of its path.
 
 ### The three primitives, and the gate
 
@@ -70,14 +78,29 @@ Error: no agent is connected
 Error: no agent is connected
 Error: no agent is connected
 Error: no agent is connected
+WARN egdod::controller: forwarded connection failed: no agent is connected
 exec, push, pull and forward all refused — the controller holds no session for an unapproved key
 ```
 
-Those four are exec, push, pull, and a live TCP connection through a `forward`
-listener; the script separately asserts no file appeared on either side and that
-the forwarded socket carried zero bytes. The refusal reads `no agent is
+The four `Error:` lines are the exec attempt (printed twice, before and after the
+file attempts) plus push and pull; the script also asserts that no file appeared
+on either side. The `WARN` is the forward: a TCP connection was made through the
+listener and the controller declined to route it. All of them read `no agent is
 connected` because the controller holds no session for an unapproved key at all
 — the gate is upstream of routing rather than a check inside it.
+
+What the demo cannot show is more than that refusal, because nothing is
+listening on the target port at that stage: "no bytes came back" would also be
+true of a working forward. The discriminating check is in
+`tests/integration.rs`, where a live echo listener is stood up *before* approval
+and a connection through the forward is required to fail:
+
+```rust
+assert!(
+    c.read_exact(&mut buf).await.is_err(),
+    "an unapproved agent carried traffic to a live service"
+);
+```
 
 **exec** keeps the streams apart and returns the status:
 
@@ -91,21 +114,23 @@ stderr file: to-stderr
 **copy**, 64 MiB each way, digest and mode intact, in bounded memory:
 
 ```
-pushed .../up.bin -> .../target/up.bin (67108864 bytes, sha256 f9992be2c4e9370f98c14ef7d1c3764922c4750161cef8149c08a0a5cb589202)
-f9992be2c4e9370f98c14ef7d1c3764922c4750161cef8149c08a0a5cb589202  .../target/up.bin
-pulled .../target/up.bin -> .../down.bin (67108864 bytes, sha256 f9992be2c4e9370f98c14ef7d1c3764922c4750161cef8149c08a0a5cb589202)
+pushed .../up.bin -> .../target/up.bin (67108864 bytes, sha256 b39d7de898133e2b3076728ce332a7ec6135e17233e244643036977acc632bbe)
+b39d7de898133e2b3076728ce332a7ec6135e17233e244643036977acc632bbe  .../target/up.bin
+pulled .../target/up.bin -> .../down.bin (67108864 bytes, sha256 b39d7de898133e2b3076728ce332a7ec6135e17233e244643036977acc632bbe)
 mode: source 640, on the target 640, pulled back 640
-agent peak RSS after a 64 MiB round trip: VmHWM:	   47028 kB
+agent peak RSS after a 64 MiB round trip: VmHWM:	   46792 kB
 ```
 
-47 MB of RSS for a 64 MiB round trip is the observation behind "handles files
-larger than RAM": the file never lands in memory.
+46 MB of RSS for a 64 MiB round trip is the observation behind "handles files
+larger than RAM": the file never lands in memory. That figure is the *agent's*
+peak; the controller's boundedness is by construction (a 64 KiB chunk in
+`proto.rs`) and was not measured.
 
 **forward**, proved by the bytes of a real service on the far side:
 
 ```
 === 10. PRIMITIVE forward — a local port onto the target's sshd, proven by its banner
-forwarding 127.0.0.1:38343 -> 127.0.0.1:2299 on the target (ctrl-c to stop)
+forwarding 127.0.0.1:39857 -> 127.0.0.1:2299 on the target (ctrl-c to stop)
 SSH-2.0-OpenSSH_10.4
 ```
 
@@ -116,12 +141,37 @@ second approval:
 ```
 === 11. approval survives a controller restart, and the agent redials on its own
 reconnected without being approved again:
-egdod: session with ea8268e3... via direct-local (127.0.0.1:49325)
+egdod: session with 815ad383... via direct-local (127.0.0.1:34254)
 still-here
 ```
 
-**exec really is root** when the agent runs as root: `uid seen by exec: 0`, and
-it read `/etc/shadow`.
+**exec bounds its own drain** without truncating a healthy command. The three
+shapes, timed against a live agent:
+
+```
+=== A: orphan that keeps writing
+real 0m16.138s   rc=0  bytes=243494898   "stopped reading" reported
+=== B: daemon that writes nothing (the sshd pattern)
+real 0m2.016s    rc=0  complete-output
+=== C: ordinary command
+real 0m0.013s    rc=5  plain
+```
+
+A is the pathological case — a command that exits leaving a writer on its pipes
+— and it terminates with the output marked as possibly incomplete rather than
+hanging. B is what `exec sshd` looks like and is unaffected. C is unchanged.
+
+**exec really is root** when the agent runs as root:
+
+```
+=== 12. exec as root (only if this machine offers passwordless sudo)
+approved 998f6b34d6fcc4aec8d4c467c15b0226a1b570b52c4e6142cd26495db1b92b11
+uid seen by exec: 0
+/etc/shadow is readable: exec really is root
+```
+
+The second line is `head -c 0 /etc/shadow` succeeding — the file was opened, not
+read, which is enough to show the privilege without putting a hash in a log.
 
 ### The ssh recipe: first connect, no trust on first use
 
@@ -136,7 +186,7 @@ egdod: installed an authorized key at .../target-authorized_keys
 egdod: no host key on the target; generating one with ["ssh-keygen", "-q", "-t", "ed25519", ...]
 egdod: no sshd answering; starting it with [".../openssh-10.4p1/bin/sshd", "-f", ...]
 egdod: sshd is up: SSH-2.0-OpenSSH_10.4
-egdod: known_hosts entry from the authenticated channel: [127.0.0.1]:35999 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEZLEL46XtebWI7lniYepMB4ZUzb8cC2+w23MB21Ee24
+egdod: known_hosts entry from the authenticated channel: [127.0.0.1]:43229 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBmSWK/Z4npqMI7tt4azR15KTk0VR8qcnxZj4R9mRfsA
 bothouse
 ```
 
@@ -182,7 +232,7 @@ An agent was then given the node id and *nothing else* — no relay URL, no
 address — and reached it:
 
 ```
-egdod: session with ad1aefaa... via direct-lan (172.18.0.1:41078)
+egdod: session with 2d3dce2b... via direct-lan (192.168.1.141:47072)
 hello-from-a-node-id-alone
 ```
 
@@ -190,12 +240,13 @@ The labels themselves, from the target's own log:
 
 ```
 INFO egdod::agent: connected to controller path=relayed remote=https://usw1-1.relay.n0.iroh.link./
-INFO egdod::agent: path changed was=relayed now=direct-lan remote=172.18.0.1:52821
+INFO egdod::agent: path changed was=relayed now=direct-lan remote=192.168.1.141:36572
 ```
 
 The session started on the relay, said so, holepunched to a LAN-routed direct
-path, and said that too. Three of the four labels — `relayed`, `direct-lan`,
-`direct-local` — were produced by this run against real infrastructure.
+path, and said that too. Three of the four labels were produced by this run:
+`relayed` and `direct-lan` against real infrastructure, `direct-local` from the
+loopback steps.
 
 ### No DNS, no interfaces but loopback
 
@@ -206,7 +257,7 @@ nothing but `lo`, and `/etc/resolv.conf` bind-mounted to `/dev/null`.
 ```
 === 17. no DNS at all, and no network but loopback — initramfs conditions
 resolv.conf is: 0 bytes
-egdod: session with 81829d1f... via direct-local (127.0.0.1:37292)
+egdod: session with d6ca9ed5... via direct-local (127.0.0.1:56871)
 exec-with-no-resolver
 ```
 
@@ -214,14 +265,55 @@ exec-with-no-resolver
 
 ```
 egdod: controller key at .../controller/controller.key — bake the node id above into images; it is public
-node id: 768ac1c98a987b941cd81a98cae121775248215bb40b720c43c8cdb13d56934a
+node id: 7fc188fe4763d73a8855c769095becf64b323fc018fb8b50e6d66322913e62fa
 total 4
--rw------- 1 bot users 32 Jul 25 05:01 controller.key
+-rw------- 1 bot users 32 Jul 25 05:40 controller.key
 ```
 
 The agent's entire configuration is `--controller <node id>` plus addressing
 flags. It generates its own keypair on first run and prints only the public
 half. Nothing secret is given to it, so nothing secret can be taken from it.
+
+## What the agent needs from its environment
+
+`SPEC.md` property 4 asks for this to be written down here, and made explicit on
+the command line where possible. The agent needs:
+
+- **A working network interface, already up and addressed.** Nothing in egdod
+  brings a link up, loads a driver, or speaks DHCP. This is the largest
+  unstated dependency: on a bare target something else must have configured the
+  NIC before the agent can dial.
+- **A writable path for `--key-file`** (default `/var/lib/egdod/agent.key`), and
+  its parent directory creatable. On a tmpfs initramfs this means a new identity
+  per boot.
+- **Nothing else.** No `/etc`, no shell, no dbus, no resolver — step 17 runs it
+  with `/etc/resolv.conf` masked and no interface but `lo`.
+
+Reaching a relay without DNS is what `--relay https://<ip-literal>/` is for:
+`RelayChoice::Urls` takes the URL verbatim and, combined with `--direct`, the
+agent installs neither a publisher nor a resolver. The URL parsing is unit
+tested; the *connection* is not — see "Not tested at all" below.
+
+### Deviations from the command surface
+
+`SPEC.md` asks for deviations to be recorded. All eight commands it lists exist
+with exactly the argument shapes it gives. The additions, none of which replace
+anything specified:
+
+- `controller status [--json]` — the spec requires the undialable state to be
+  *exposed*; this is the exposure, and it exits 2 when the answer is "nobody can
+  dial me".
+- `agent --key-file <path>` — property 6 says no fixed system paths, so the
+  agent's one piece of state is nameable too.
+- `controller serve --bind/--probe-interval/--probe-timeout/--restart-after` —
+  pinning the UDP port is what lets a `--direct` hint survive a restart; the
+  probe knobs exist so the demo can force the undialable case.
+- `controller ssh --user/--authorized-keys/--host-key/--sshd-arg/--keygen-arg/
+  --target-addr/--local-port` — the recipe has to name paths, and argv rather
+  than a command string, on a target with no shell to split one; the defaults
+  are the real ones (`root`, `/root/.ssh/authorized_keys`, `sshd`,
+  `127.0.0.1:22`) and the flags exist so the demo can point it at an
+  unprivileged sshd instead.
 
 ## NOT PROVED — and one of these is a spec failure
 
@@ -276,11 +368,17 @@ anything.
   fixed paths — and the design respects it, but nothing was built or run on
   aarch64 and no controller has run on a handset.
 - **Throughput over a relay.** The 64 MiB round trip was loopback. No number
-  here describes a relayed transfer.
-- **A hostile agent.** An approved agent declares a file's length on `pull` and
-  the controller writes up to that length before the digest check fails. No cap,
-  no free-space check. Approved targets are untrusted hardware by design, so
-  this is a real hole.
+  here describes a relayed transfer. Over the public relay the demo exercises
+  `exec` only — copy, forward and the ssh recipe all ran on loopback.
+- **Reaching a relay without DNS.** `--relay https://<ip-literal>/` is the
+  documented answer and its URL parsing is unit tested, but no connection has
+  been made that way. The no-DNS phase that *was* run used `--no-relay
+  --direct`, which avoids the question rather than answering it.
+- **A hostile agent.** An approved agent declares both the length and the digest
+  of a file on `pull`, so an oversized transfer does not merely get written
+  before a check fails — it succeeds. No cap, no free-space check, and on the
+  ssh path the staged file is then read whole into controller memory. Approved
+  targets are untrusted hardware by design, so this is a real hole.
 - **Many agents.** One or two at a time. The pending list's 256-entry bound has
   never been reached.
 - **Revocation.** Removing a key from `approved` does not end a live session,
@@ -296,10 +394,10 @@ next round of proving.
   source, and the failure reproduces exactly where that predicts. But no patched
   build was made, so it is not established that fixing the alignment is
   *sufficient* — only that it is the first thing in the way.
-- **exec's stall deadline behaves under a slow link.** The deadline resets
-  whenever a frame reaches the wire, and a stalled drain emits `Truncated`
-  before the exit status. Reasoned about, not demonstrated: no test drives a
-  command that outruns its link.
+- **exec's drain behaves under a genuinely slow controller.** The three shapes
+  that matter were measured (see PROVED above), but all of them on loopback. The
+  case the drain is really designed for — a controller reading slowly enough
+  that the writer stays blocked mid-send — was reasoned about, not reproduced.
 - **The endpoint rebuild fixes a genuinely undialable controller.** Step 12b
   proves the *reaction* — detection, the loud log, the rebuild. It does not
   prove the rebuild restores dialability, because the failure was forced with a
