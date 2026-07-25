@@ -35,6 +35,9 @@ pub struct ServeConfig {
     /// Consecutive canary failures tolerated before the endpoint is rebuilt. The
     /// prior art's undialable-controller flake cleared on exactly that.
     pub restart_after: u32,
+    /// Pin the UDP socket, so agents can be given a fixed --direct address that
+    /// survives a controller restart.
+    pub bind_addr: Option<SocketAddr>,
 }
 
 #[derive(Clone)]
@@ -104,7 +107,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<()> {
     println!("state dir: {}", cfg.state.root().display());
 
     loop {
-        let ep = net::bind(Some(secret.clone()), &cfg.relay, Lookup::BOTH).await?;
+        let ep = net::bind(Some(secret.clone()), &cfg.relay, Lookup::BOTH, cfg.bind_addr).await?;
         let addrs: Vec<SocketAddr> = ep.addr().ip_addrs().copied().collect();
         status
             .update(|s| s.direct_addrs = addrs.iter().map(|a| a.to_string()).collect())
@@ -135,6 +138,7 @@ pub async fn serve(cfg: ServeConfig) -> Result<()> {
             cfg.probe_timeout,
             cfg.restart_after,
             status.clone(),
+            sessions.clone(),
             restart_tx,
         ));
 
@@ -266,10 +270,14 @@ async fn canary(
     timeout: Duration,
     restart_after: u32,
     status: Arc<StatusFile>,
+    sessions: Sessions,
     restart: tokio::sync::oneshot::Sender<()>,
 ) {
     let mut failures = 0u32;
     loop {
+        // A session that started on the relay and later holepunched to a direct
+        // path would otherwise keep its stale label in status.json.
+        publish_sessions(&sessions, &status).await;
         match net::probe(node_id, mode, &addrs, &relay, timeout).await {
             Ok(path) => {
                 failures = 0;

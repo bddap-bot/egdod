@@ -90,7 +90,7 @@ async fn session(secret: &SecretKey, cfg: &Config) -> Result<Outcome> {
     } else {
         net::Lookup::NONE
     };
-    let ep = net::bind(Some(secret.clone()), &cfg.relay, lookup).await?;
+    let ep = net::bind(Some(secret.clone()), &cfg.relay, lookup, None).await?;
     let addr = net::endpoint_addr(cfg.controller, &cfg.direct, cfg.relay_url.as_ref());
     let connected = tokio::time::timeout(CONNECT_TIMEOUT, ep.connect(addr, ALPN)).await;
     let outcome = match connected {

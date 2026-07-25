@@ -71,8 +71,22 @@ impl Lookup {
     };
 }
 
-pub async fn bind(secret: Option<SecretKey>, relay: &RelayChoice, lookup: Lookup) -> Result<Endpoint> {
+/// `bind_addr` pins the UDP socket. A controller that keeps its port across
+/// restarts is what lets a target be given a fixed `--direct` address and no DNS
+/// at all; leave it `None` to let the OS choose, which is right everywhere else.
+pub async fn bind(
+    secret: Option<SecretKey>,
+    relay: &RelayChoice,
+    lookup: Lookup,
+    bind_addr: Option<SocketAddr>,
+) -> Result<Endpoint> {
     let mut b = Endpoint::builder(presets::Minimal).relay_mode(relay.mode()?);
+    if let Some(addr) = bind_addr {
+        b = b
+            .clear_ip_transports()
+            .bind_addr(addr)
+            .map_err(|e| anyhow::anyhow!("binding {addr}: {e}"))?;
+    }
     if let Some(secret) = secret {
         b = b.secret_key(secret);
     }
@@ -191,7 +205,7 @@ pub async fn probe(
         ProbeMode::Discovery => Lookup::RESOLVE,
         ProbeMode::Direct => Lookup::NONE,
     };
-    let ep = bind(None, relay, lookup).await?;
+    let ep = bind(None, relay, lookup, None).await?;
     let addr = match mode {
         ProbeMode::Discovery => EndpointAddr::new(target),
         ProbeMode::Direct => endpoint_addr(target, direct, None),

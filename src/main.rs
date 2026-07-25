@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::io::IsTerminal;
 use clap::{Args, Parser, Subcommand};
 use egdod::controller::{self, ServeConfig};
 use egdod::net::RelayChoice;
@@ -69,6 +70,10 @@ enum ControllerCmd {
         /// Rebuild the iroh endpoint after this many consecutive failed probes.
         #[arg(long, default_value_t = 2)]
         restart_after: u32,
+        /// Pin the UDP socket to this address, so a target can be given a fixed
+        /// --direct address that survives a controller restart.
+        #[arg(long)]
+        bind: Option<SocketAddr>,
     },
     /// Agents that have dialled in and are waiting to be approved.
     Pending {
@@ -116,10 +121,10 @@ enum ControllerCmd {
         #[arg(long, default_value = "/etc/ssh/ssh_host_ed25519_key.pub")]
         host_key: String,
         /// argv used to start sshd on the target, repeat once per word.
-        #[arg(long = "sshd-arg")]
+        #[arg(long = "sshd-arg", allow_hyphen_values = true)]
         sshd_arg: Vec<String>,
         /// argv used to generate host keys on the target, repeat once per word.
-        #[arg(long = "keygen-arg")]
+        #[arg(long = "keygen-arg", allow_hyphen_values = true)]
         keygen_arg: Vec<String>,
         /// The target's sshd address, as seen from the target.
         #[arg(long, default_value = "127.0.0.1:22")]
@@ -141,6 +146,9 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "egdod=info,warn".into()),
         )
         .with_writer(std::io::stderr)
+        // Logs are routinely captured to a file (a serial console, a demo
+        // transcript); escape codes there are noise.
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
 
     match Cli::parse().role {
@@ -178,6 +186,7 @@ async fn run_controller(state: StateDir, cmd: ControllerCmd) -> Result<()> {
             probe_interval,
             probe_timeout,
             restart_after,
+            bind,
         } => {
             controller::serve(ServeConfig {
                 state,
@@ -185,6 +194,7 @@ async fn run_controller(state: StateDir, cmd: ControllerCmd) -> Result<()> {
                 probe_interval: Duration::from_secs(probe_interval),
                 probe_timeout: Duration::from_secs(probe_timeout),
                 restart_after,
+                bind_addr: bind,
             })
             .await
         }
