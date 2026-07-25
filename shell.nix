@@ -18,7 +18,7 @@ in
 pkgs.mkShell {
   # NOTE: musl-gcc must NOT go in nativeBuildInputs — its setup hook overrides
   # stdenv's CC/CXX/AR and poisons host builds. Referenced by store path only.
-  nativeBuildInputs = with pkgs; [ rust pkg-config perl openssh ];
+  nativeBuildInputs = with pkgs; [ rust pkg-config perl openssh jq file ];
   # ring compiles C for the musl target; point cc at the cross toolchain.
   # NOTE: if RUSTC_WRAPPER is a build accelerator (sccache/kache/…), cc-rs
   # prefixes it onto this compiler too, so unset RUSTC_WRAPPER for the musl

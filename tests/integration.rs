@@ -164,7 +164,7 @@ async fn end_to_end_loopback() {
     // select another local interface, but it must never read as relayed.
     let path = {
         let g = running.agents.lock().await;
-        let conn = g.get(&agent_pk).expect("agent still registered");
+        let (_, conn) = g.get(&agent_pk).expect("agent still registered");
         egdod::classify_path(conn)
     };
     assert!(path.starts_with("direct-"), "unexpected path label: {path}");

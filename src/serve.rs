@@ -36,7 +36,7 @@ pub fn relay_mode(relay: &Option<RelayUrl>, no_relay: bool) -> RelayMode {
 #[derive(Clone, Debug)]
 struct AgentHandler {
     state_dir: Arc<PathBuf>,
-    agents: Arc<tokio::sync::Mutex<HashMap<PublicKey, Connection>>>,
+    agents: Agents,
 }
 
 impl ProtocolHandler for AgentHandler {
@@ -70,12 +70,18 @@ impl AgentHandler {
             "egdod serve: agent {peer} connected — path: {}",
             classify_path(&conn)
         );
-        self.agents.lock().await.insert(peer, conn.clone());
+        // A redial replaces the registry entry; the evicted connection's
+        // cleanup must not remove the NEW registration when it dies.
+        let id = conn.stable_id();
+        self.agents.lock().await.insert(peer, (id, conn.clone()));
         let agents = self.agents.clone();
         tokio::spawn(async move {
             conn.closed().await;
-            agents.lock().await.remove(&peer);
-            println!("egdod serve: agent {peer} disconnected");
+            let mut g = agents.lock().await;
+            if g.get(&peer).is_some_and(|(stored, _)| *stored == id) {
+                g.remove(&peer);
+                println!("egdod serve: agent {peer} disconnected");
+            }
         });
         Ok(())
     }
@@ -110,7 +116,7 @@ pub async fn run(opts: ServeOpts) -> Result<()> {
     bridge_listener(running.state_dir.clone(), running.agents).await
 }
 
-pub type Agents = Arc<tokio::sync::Mutex<HashMap<PublicKey, Connection>>>;
+pub type Agents = Arc<tokio::sync::Mutex<HashMap<PublicKey, (usize, Connection)>>>;
 
 /// Everything `run` sets up, minus the parts a test wants to skip (canary)
 /// or drive itself (the bridge listener).
@@ -184,7 +190,7 @@ pub async fn bridge_listener(state_dir: PathBuf, agents: Agents) -> Result<()> {
 /// stays in the CLI and the agent; serve only routes.
 async fn bridge_session(
     sock: UnixStream,
-    agents: Arc<tokio::sync::Mutex<HashMap<PublicKey, Connection>>>,
+    agents: Agents,
 ) -> Result<()> {
     let (read, mut write) = sock.into_split();
     let mut reader = BufReader::new(read);
@@ -198,7 +204,7 @@ async fn bridge_session(
         }
     };
     let conn = match pk {
-        Ok(pk) => agents.lock().await.get(&pk).cloned(),
+        Ok(pk) => agents.lock().await.get(&pk).map(|(_, c)| c.clone()),
         Err(_) => None,
     };
     let conn = match conn {
@@ -360,9 +366,17 @@ async fn canary_once(mode: &RelayMode, id: EndpointId) -> Result<String> {
         .await
         .context("binding canary endpoint")?;
     let dial = ep.connect(EndpointAddr::new(id), CANARY_ALPN);
-    let conn = tokio::time::timeout(CANARY_TIMEOUT, dial)
-        .await
-        .map_err(|_| anyhow::anyhow!("self-dial by NodeId timed out after {CANARY_TIMEOUT:?}"))??;
+    let conn = match tokio::time::timeout(CANARY_TIMEOUT, dial).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            ep.close().await;
+            return Err(e).context("self-dial by NodeId failed");
+        }
+        Err(_) => {
+            ep.close().await;
+            anyhow::bail!("self-dial by NodeId timed out after {CANARY_TIMEOUT:?}");
+        }
+    };
     let path = classify_path(&conn);
     conn.close(0u32.into(), b"canary done");
     ep.close().await;

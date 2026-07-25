@@ -47,6 +47,7 @@ pub async fn run(opts: AgentOpts) -> Result<()> {
             Ok(()) => {
                 // Clean close: the controller went away or rejected us.
                 println!("egdod agent: session ended; redialing");
+                backoff = DIAL_MIN_BACKOFF;
             }
             Err(e) => {
                 println!("egdod agent: dial failed: {e:#}");
@@ -61,10 +62,12 @@ async fn dial_once(key: &SecretKey, opts: &AgentOpts, relay_mode: &RelayMode) ->
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(key.clone())
         .relay_mode(relay_mode.clone());
-    // With explicit hints the dial needs no discovery at all — this is what
+    // A relay hint suffices to dial with no discovery at all — this is what
     // lets an initramfs without working DNS reach the controller (the relay
-    // URL may be an IP literal, and --direct is an IP by construction).
-    if !opts.direct.is_empty() || opts.relay.is_some() {
+    // URL may be an IP literal). --direct keeps discovery as a fallback: a
+    // hint goes stale when the controller restarts on a new port, and with no
+    // fallback the agent could never find it again.
+    if opts.relay.is_some() {
         builder = builder.clear_address_lookup();
     }
     let endpoint = builder.bind().await.context("binding agent endpoint")?;
@@ -77,18 +80,44 @@ async fn dial_once(key: &SecretKey, opts: &AgentOpts, relay_mode: &RelayMode) ->
         addr = addr.with_relay_url(url.clone());
     }
 
-    let conn = endpoint
-        .connect(addr, ALPN)
-        .await
-        .context("connecting to controller")?;
+    let conn = match endpoint.connect(addr, ALPN).await {
+        Ok(c) => c,
+        Err(e) => {
+            // Close before returning so a failed attempt leaves no ungraceful
+            // endpoint teardown behind on the console of a target nobody is
+            // watching.
+            endpoint.close().await;
+            return Err(e).context("connecting to controller");
+        }
+    };
     let session = serve_session(&conn);
     let ended = conn.closed();
+    // Liveness watchdog: a controller that vanishes mid-path-flap can leave
+    // this side half-open with no close frame ever arriving (observed: relay
+    // path ping-ponging with a dead direct path, controller long gone). A
+    // connection with zero open paths sustained is definitionally dead — the
+    // spec's "never gives up" requires noticing and redialing, not waiting
+    // on a QUIC idle timeout that may never come.
+    let watchdog = async {
+        let mut empty = 0u32;
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if conn.paths().is_empty() {
+                empty += 1;
+                if empty >= 3 {
+                    println!("egdod agent: no open paths for 15s — declaring the session dead");
+                    return;
+                }
+            } else {
+                empty = 0;
+            }
+        }
+    };
     tokio::pin!(ended);
-    // Serve until the connection dies, whichever the session loop notices
-    // first; then close the endpoint so the redial starts from a clean slate.
     let r = tokio::select! {
         r = session => r,
         _ = &mut ended => Ok(()),
+        _ = watchdog => Ok(()),
     };
     endpoint.close().await;
     r
