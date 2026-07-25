@@ -503,10 +503,16 @@ where
     }
     out.flush().await?;
     err.flush().await?;
-    // Loud, because the exit status that follows is about the command and says
-    // nothing about whether its output arrived whole.
+    // Said out loud, because the exit status is about the command and says
+    // nothing about whether its output arrived whole. Hedged, because the usual
+    // cause is a daemon the command left holding the pipes, in which case the
+    // output above is complete and only the agent's certainty is missing.
     if truncated {
-        tracing::warn!("the target cut this command's output off; what you have above is a prefix");
+        tracing::warn!(
+            "the target stopped reading this command's output before end of file \
+             (usually a daemon it started still holds the pipes); the output above \
+             may be incomplete"
+        );
     }
     code.context("agent closed the stream without reporting an exit status")
 }
