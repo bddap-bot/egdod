@@ -25,12 +25,12 @@ have not entirely resisted the influence.
 
 ## Status
 
-Early. See `SPEC.md` for what v0 is contracted to do, and `PROOF.md` for what has actually been
-observed working rather than merely intended.
-
-## License
-
-Dual MIT / Apache-2.0, at your option.
+Early, and the first paragraph above is the intent rather than the achievement. The protocol works:
+three primitives, approval by public key, and the ssh recipe, over a real iroh connection through a
+public relay — see `PROOF.md`, which separates what was watched happening from what is merely
+believed. What does not work yet is the boot: the static binary meant for a machine with no
+userland aborts on its first packet, and there is no image to put it on. `SPEC.md` is the contract,
+`INTEGRATION.md` says how the two competing implementations became this one and what is still owed.
 
 ## Try it
 
@@ -52,3 +52,7 @@ egdod controller ssh  <agent>
 
 `nix-build musl.nix` cross-builds the static agent — but read the failure section
 in `PROOF.md` before trusting it.
+
+## License
+
+Dual MIT / Apache-2.0, at your option.
