@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 # Stands up a controller and an agent on this one machine and exercises
 # everything egdod v0 claims: approval, the three primitives, the ssh recipe,
-# and the reachability canary. Unattended, hermetic (no relay, no DNS, no
-# network beyond loopback), and it cleans up after itself.
+# the reachability canary, and — off loopback — discovery, a real relay, and
+# the path labels. Unattended, and it cleans up after itself.
+#
+# Steps 0-14 are hermetic (no relay, no DNS, nothing but loopback). Steps 15-17
+# use the public relay and n0's DNS, because "relayed" is a label loopback
+# cannot produce; set EGDOD_DEMO_OFFLINE=1 to skip them and be told what was
+# therefore not proved.
 #
 # Needs: bash, cargo (or a prebuilt binary in EGDOD_BIN), sshd, ssh, ssh-keygen,
-# sha256sum, head. Runs unprivileged; if passwordless sudo happens to be
-# available it additionally proves exec-as-root with a second agent.
+# sha256sum, head. Runs unprivileged; passwordless sudo, if available, adds
+# exec-as-root and the no-DNS namespace. EGDOD_MUSL_BIN points step 18 at the
+# static build.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -27,7 +33,9 @@ cleanup() {
   # scratch directory, including processes reparented to init.
   pkill -f "$DEMO" 2>/dev/null || true
   sudo -n pkill -f "$DEMO" 2>/dev/null || true
-  rm -rf "$DEMO"
+  # The root-run phases leave root-owned files behind, so the unprivileged
+  # removal is allowed to fail before the privileged one finishes the job.
+  rm -rf "$DEMO" 2>/dev/null || sudo -n rm -rf "$DEMO" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -234,7 +242,12 @@ UND=$DEMO/undialable
 PIDS+=($!)
 wait_for 60 "[ -s '$UND/status.json' ] && grep -qE '\"endpoint_restarts\": [1-9]' '$UND/status.json'"
 grep -m3 -E "UNDIALABLE|rebuilding" "$DEMO/undialable.log"
-"$BIN" controller --state-dir "$UND" status
+# `status` exits 2 on an undialable controller, which is the point of this step;
+# under `set -e` that has to be caught rather than treated as the script failing.
+"$BIN" controller --state-dir "$UND" status && {
+  echo "DEFECT: status reported success for an undialable controller" >&2; exit 1
+}
+echo "status exited 2 — a program can act on this without parsing prose"
 kill "${PIDS[-1]}" 2>/dev/null || true
 
 say "13. final controller status"
@@ -243,30 +256,126 @@ ctl status --json
 say "14. controller log (paths reported for every session, canary results)"
 grep -E 'agent connected|routed a session|reachability|UNDIALABLE|pending' "$DEMO/serve.log" | tail -12
 
-# Everything above is hermetic. This last phase is the real-world configuration —
-# public relay, address lookup over DNS, the agent dialling nothing but a node id —
-# and therefore needs working internet, so it is opt-in.
-if [ "${EGDOD_DEMO_RELAY:-0}" = 1 ]; then
-  say "15. relay + discovery: the agent knows only the node id"
+# Everything above is hermetic, and hermetic is not the configuration this is
+# for. The phases below are the real one — public relay, address lookup over DNS,
+# the agent knowing nothing but a node id — so they need working internet. They
+# run by DEFAULT: a phase that is off unless someone remembers a variable is a
+# phase that never runs, and "relayed" is precisely the label that cannot be
+# checked on loopback.
+if [ "${EGDOD_DEMO_OFFLINE:-0}" = 1 ]; then
+  say "15-17. SKIPPED (EGDOD_DEMO_OFFLINE=1)"
+  echo "NOT EXERCISED: discovery, relay, and the relayed path label. This run"
+  echo "proves nothing about how egdod behaves off loopback."
+else
   R=$DEMO/relay
   RSTATE=$R/controller
   mkdir -p "$R"
-  RNODE=$("$BIN" controller --state-dir "$RSTATE" init)
-  "$BIN" controller --state-dir "$RSTATE" serve --probe-interval 15 --probe-timeout 20 \
-    >"$R/serve.log" 2>&1 &
+  rctl() { "$BIN" controller --state-dir "$RSTATE" "$@"; }
+
+  say "15. relay + discovery: the agent is given the node id and nothing else"
+  RNODE=$(rctl init)
+  rctl serve --probe-interval 15 --probe-timeout 20 >"$R/serve.log" 2>&1 &
   PIDS+=($!)
   wait_for 60 "[ -S '$RSTATE/control.sock' ]"
-  wait_for 120 "[ -s '$RSTATE/status.json' ] && grep -q '\"dialable\": true' '$RSTATE/status.json'"
+  wait_for 120 "grep -q '\"dialable\": true' '$RSTATE/status.json' 2>/dev/null"
   echo "canary in discovery mode (dialled its own node id through n0 DNS + relay):"
   grep -E '"probe_mode"|"dialable"|"last_probe_path"' "$RSTATE/status.json"
+  # No --direct, no --relay: everything comes from resolving the node id.
   "$BIN" agent --controller "$RNODE" --key-file "$R/agent.key" >"$R/agent.log" 2>&1 &
   PIDS+=($!)
   wait_for 60 "grep -q 'agent pubkey' '$R/agent.log'"
   RAGENT=$(sed -n 's/^agent pubkey: //p' "$R/agent.log" | head -1)
-  "$BIN" controller --state-dir "$RSTATE" approve "$RAGENT"
-  wait_for 90 "'$BIN' controller --state-dir '$RSTATE' status --json | grep -q '$RAGENT'"
-  "$BIN" controller --state-dir "$RSTATE" exec "$RAGENT" -- /bin/sh -c 'echo hello-over-the-internet'
-  "$BIN" controller --state-dir "$RSTATE" status
+  rctl approve "$RAGENT"
+  wait_for 120 "rctl status --json | grep -q '$RAGENT'"
+  rctl exec "$RAGENT" -- /bin/sh -c 'echo hello-from-a-node-id-alone'
+  rctl status
+
+  say "16. the relayed label, and a session that stops being relayed"
+  # Both ends are on one host, so holepunching always wins eventually and a
+  # session cannot be pinned to the relay to be photographed. What can be shown
+  # is the truth: the session *starts* relayed, says so, and says so again when
+  # it changes. A label that never changed would be the defect.
+  echo "what the target logged about its own path:"
+  grep -E 'connected to controller|path changed' "$R/agent.log" || true
+  if ! grep -qE 'path=relayed|was=relayed|"last_probe_path": "relayed"' \
+      "$R/agent.log" "$RSTATE/status.json"; then
+    echo "DEFECT: nothing in this run ever reported a relayed path, so the" >&2
+    echo "        relayed/direct distinction went untested." >&2
+    exit 1
+  fi
+  echo "relay in use: $(grep -hoE 'https://[a-z0-9.-]+\.relay\.n0\.iroh\.link\.?' \
+    "$R/agent.log" "$RSTATE/status.json" 2>/dev/null | head -1)"
+
+  say "17. no DNS at all, and no network but loopback — initramfs conditions"
+  # The rest of this script gets away without DNS by accident (it hands the agent
+  # a --direct address). This proves it: a fresh network namespace with nothing
+  # but lo, and /etc/resolv.conf masked out, which is what an initramfs looks like.
+  if sudo -n true 2>/dev/null; then
+    sudo -n unshare -n --mount bash -c '
+      set -e
+      mount --bind /dev/null /etc/resolv.conf
+      ip link set lo up
+      B=$1; D=$2/nodns; mkdir -p "$D"
+      ID=$("$B" controller --state-dir "$D/ctl" init)
+      "$B" controller --state-dir "$D/ctl" serve --no-relay --bind 127.0.0.1:45888 \
+        >"$D/serve.log" 2>&1 &
+      for _ in $(seq 60); do [ -S "$D/ctl/control.sock" ] && break; sleep 0.25; done
+      "$B" agent --controller "$ID" --key-file "$D/agent.key" \
+        --no-relay --direct 127.0.0.1:45888 >"$D/agent.log" 2>&1 &
+      for _ in $(seq 60); do grep -q "agent pubkey" "$D/agent.log" && break; sleep 0.25; done
+      PK=$(sed -n "s/^agent pubkey: //p" "$D/agent.log" | head -1)
+      "$B" controller --state-dir "$D/ctl" approve "$PK"
+      for _ in $(seq 80); do
+        "$B" controller --state-dir "$D/ctl" exec "$PK" -- /bin/echo ok >/dev/null 2>&1 && break
+        sleep 0.25
+      done
+      echo "resolv.conf is: $(cat /etc/resolv.conf | wc -c) bytes"
+      "$B" controller --state-dir "$D/ctl" exec "$PK" -- /bin/sh -c "echo exec-with-no-resolver"
+      kill %1 %2 2>/dev/null || true
+    ' _ "$BIN" "$DEMO"
+  else
+    echo "SKIPPED: needs passwordless sudo to create a network namespace"
+  fi
 fi
 
-say "demo complete: all primitives, the recipe, and the canary exercised"
+GAPS=0
+say "18. the static agent — the binary this is supposed to boot on"
+# Built separately (nix-build musl.nix); run here rather than merely inspected,
+# because `file` says nothing about whether it works.
+MUSL=${EGDOD_MUSL_BIN:-}
+if [ -x "$MUSL" ]; then
+  file "$MUSL"
+  M=$DEMO/musl; mkdir -p "$M"
+  set +e
+  timeout 20 "$MUSL" agent --controller "$NODE_ID" --key-file "$M/agent.key" \
+    --no-relay --direct "$DIRECT" >"$M/agent.log" 2>&1
+  MUSL_RC=$?
+  set -e
+  if grep -q 'align_of' "$M/agent.log"; then
+    GAPS=1
+    echo "GAP: the static binary aborts on its first datagram (rc=$MUSL_RC):"
+    grep -m2 -E 'panicked|assertion' "$M/agent.log"
+    echo "     musl aligns struct cmsghdr to 4 bytes where the kernel lays out"
+    echo "     cmsg payloads at 8; iroh's UDP layer sets SO_TIMESTAMPNS and"
+    echo "     decodes SCM_TIMESTAMPNS as a struct timespec, whose alignment"
+    echo "     assertion then fails. This is a dependency bug, not an egdod one,"
+    echo "     and it means property 4 of SPEC.md is NOT met."
+  elif [ "$MUSL_RC" = 124 ]; then
+    echo "the static binary ran for 20s without aborting"
+    grep -m2 -E 'connected|path' "$M/agent.log" || true
+  else
+    echo "the static binary exited rc=$MUSL_RC:"; tail -5 "$M/agent.log"
+  fi
+else
+  GAPS=1
+  echo "not checked: set EGDOD_MUSL_BIN to the output of \`nix-build musl.nix\`"
+  echo "GAP: SPEC.md property 4 wants a working static musl agent. See PROOF.md."
+fi
+
+if [ "$GAPS" = 0 ]; then
+  say "demo complete: every claim above was exercised, including the static agent"
+else
+  say "demo complete: primitives, recipe, canary and relay all exercised — but see the GAP above"
+  echo "egdod works on the machine you build it on. It does not yet run on the"
+  echo "machine it is for. PROOF.md and INTEGRATION.md say exactly how far that is."
+fi
