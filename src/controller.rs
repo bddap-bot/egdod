@@ -477,16 +477,23 @@ where
     write_msg(&mut r.write, &Request::Exec { argv }).await?;
     finish(&mut r.write).await?;
     let mut code = None;
+    let mut truncated = false;
     while let Some(frame) = read_msg_opt::<_, ExecFrame>(&mut r.read).await? {
         match frame {
             ExecFrame::Stdout(b) => out.write_all(&b).await?,
             ExecFrame::Stderr(b) => err.write_all(&b).await?,
             ExecFrame::Exit(c) => code = Some(c),
             ExecFrame::Failed(e) => bail!("exec failed on the target: {e}"),
+            ExecFrame::Truncated => truncated = true,
         }
     }
     out.flush().await?;
     err.flush().await?;
+    // Loud, because the exit status that follows is about the command and says
+    // nothing about whether its output arrived whole.
+    if truncated {
+        tracing::warn!("the target cut this command's output off; what you have above is a prefix");
+    }
     code.context("agent closed the stream without reporting an exit status")
 }
 
