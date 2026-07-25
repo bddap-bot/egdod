@@ -118,7 +118,7 @@ impl StateDir {
     /// into images, so creating it is `init`'s whole job.
     pub fn init_key(&self) -> Result<SecretKey> {
         self.ensure()?;
-        load_or_create_key(&self.key_path())
+        load_or_create_key(&self.key_path(), OnUnusable::Refuse)
     }
 
     pub fn load_key(&self) -> Result<SecretKey> {
@@ -267,24 +267,37 @@ fn read_key(path: &Path) -> Result<Option<SecretKey>> {
     }
 }
 
-/// Loads the key at `path`, creating one if there is none.
+/// What to do about a key file that exists but cannot be used.
 ///
-/// Shared by the controller and the agent so there is one answer to "where does
-/// an identity come from" — and, for the agent, so a half-written key from a
-/// power cut during first boot is replaced rather than becoming a permanent
-/// crash on a machine with no screen.
-pub fn load_or_create_key(path: &Path) -> Result<SecretKey> {
+/// The two roles need opposite answers. A target has no screen and no operator,
+/// so a key truncated by a power cut during first boot must be replaced or the
+/// machine is bricked. A controller has an operator, and its key *is* the
+/// identity baked into every image — silently minting a new one would strand
+/// every target that already carries the old NodeId.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OnUnusable {
+    Replace,
+    Refuse,
+}
+
+/// Loads the key at `path`, creating one if there is none. Shared by both roles
+/// so there is one answer to "where does an identity come from".
+pub fn load_or_create_key(path: &Path, unusable: OnUnusable) -> Result<SecretKey> {
     match read_key(path) {
         Ok(Some(k)) => return Ok(k),
         Ok(None) => {}
-        Err(e) => {
+        Err(e) if unusable == OnUnusable::Replace => {
             tracing::error!("replacing unusable key file {}: {e:#}", path.display());
         }
+        Err(e) => return Err(e),
     }
     let mut bytes = [0u8; 32];
     getrandom::getrandom(&mut bytes).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
     if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            // Only a directory this call created is restricted: the key file may
+            // legitimately live in a shared directory, and an agent running as
+            // init that chmod-0700'd, say, /etc would take the machine down.
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
             restrict(parent)?;

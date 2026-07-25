@@ -94,7 +94,29 @@ if grep -q should-not-run "$DEMO/refused.out"; then
   echo "DEFECT: the command ran anyway" >&2
   exit 1
 fi
-echo "refused, as required — the controller holds no session for an unapproved key"
+# "Given nothing" means no files and no ports either, not just no exec.
+echo unapproved-probe >"$DEMO/probe.bin"
+if ctl push "$AGENT" "$DEMO/probe.bin" "$DEMO/target/probe.bin" >>"$DEMO/refused.out" 2>&1; then
+  echo "DEFECT: an unapproved agent accepted a file" >&2; exit 1
+fi
+if ctl pull "$AGENT" "$DEMO/probe.bin" "$DEMO/stolen" >>"$DEMO/refused.out" 2>&1; then
+  echo "DEFECT: an unapproved agent handed a file over" >&2; exit 1
+fi
+if [ -e "$DEMO/target/probe.bin" ] || [ -e "$DEMO/stolen" ]; then
+  echo "DEFECT: a file crossed to or from an unapproved agent" >&2; exit 1
+fi
+# forward only routes when something connects, so it is tested by connecting.
+"$BIN" controller --state-dir "$STATE" forward "$AGENT" 0 "127.0.0.1:$SSHD_PORT" \
+  >"$DEMO/refused-fwd.log" 2>&1 &
+REFUSED_FWD=$!
+PIDS+=("$REFUSED_FWD")
+wait_for 20 "grep -q forwarding '$DEMO/refused-fwd.log'"
+RP=$(sed -n 's/^forwarding 127.0.0.1:\([0-9]*\).*/\1/p' "$DEMO/refused-fwd.log" | head -1)
+GOT=$(timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/$RP; head -c 16 <&3" || true)
+kill "$REFUSED_FWD" 2>/dev/null || true
+if [ -n "$GOT" ]; then echo "DEFECT: the forward carried data: $GOT" >&2; exit 1; fi
+cat "$DEMO/refused.out"
+echo "exec, push, pull and forward all refused — the controller holds no session for an unapproved key"
 
 say "6. approve by public key (scriptable), and watch the session appear"
 ctl approve "$AGENT"
@@ -114,6 +136,10 @@ echo "stderr file: $(grep to-stderr "$DEMO/exec.err")"
 [ "$code" = 7 ] || { echo "DEFECT: wrong exit status" >&2; exit 1; }
 grep -qx to-stdout "$DEMO/exec.out"
 grep -qx to-stderr "$DEMO/exec.err"
+# and neither stream leaked into the other
+if grep -q to-stderr "$DEMO/exec.out" || grep -q to-stdout "$DEMO/exec.err"; then
+  echo "DEFECT: the two streams were mixed" >&2; exit 1
+fi
 
 say "8. PRIMITIVE copy — 64 MiB up, verified on the target, then back down"
 head -c 67108864 /dev/urandom >"$DEMO/up.bin"
@@ -125,8 +151,9 @@ ctl pull "$AGENT" "$DEMO/target/up.bin" "$DEMO/down.bin"
 sha256sum "$DEMO/up.bin" "$DEMO/down.bin"
 [ "$(sha256sum <"$DEMO/up.bin")" = "$(sha256sum <"$DEMO/down.bin")" ] \
   || { echo "DEFECT: round trip corrupted the file" >&2; exit 1; }
-echo "mode on the target: $(stat -c %a "$DEMO/target/up.bin") (source was 640)"
+echo "mode: source 640, on the target $(stat -c %a "$DEMO/target/up.bin"), pulled back $(stat -c %a "$DEMO/down.bin")"
 [ "$(stat -c %a "$DEMO/target/up.bin")" = 640 ]
+[ "$(stat -c %a "$DEMO/down.bin")" = 640 ]
 # A streaming copy must not have cost the agent 64 MiB of RAM.
 [ -n "$AGENT_PID" ] && echo "agent peak RSS after a 64 MiB round trip: $(grep VmHWM "/proc/$AGENT_PID/status")"
 
@@ -205,7 +232,7 @@ UND=$DEMO/undialable
 "$BIN" controller --state-dir "$UND" serve --no-relay --bind 127.0.0.1:0 \
   --probe-interval 1 --probe-timeout 0 --restart-after 2 >"$DEMO/undialable.log" 2>&1 &
 PIDS+=($!)
-wait_for 60 "[ -s '$UND/status.json' ] && grep -q '\"endpoint_restarts\": 1' '$UND/status.json'"
+wait_for 60 "[ -s '$UND/status.json' ] && grep -qE '\"endpoint_restarts\": [1-9]' '$UND/status.json'"
 grep -m3 -E "UNDIALABLE|rebuilding" "$DEMO/undialable.log"
 "$BIN" controller --state-dir "$UND" status
 kill "${PIDS[-1]}" 2>/dev/null || true
