@@ -36,8 +36,17 @@ fn mode_of(path: &Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
 }
 
+/// The whole test, under one deadline. Every step below awaits network I/O with
+/// no timeout of its own, so a regression that wedges the agent would otherwise
+/// hang `cargo test` forever instead of failing it.
 #[tokio::test(flavor = "multi_thread")]
 async fn controller_and_agent_over_iroh() {
+    tokio::time::timeout(Duration::from_secs(180), end_to_end())
+        .await
+        .expect("the end-to-end test wedged rather than finishing");
+}
+
+async fn end_to_end() {
     let dir = tempfile::tempdir().unwrap();
     let state = StateDir::new(dir.path().join("controller"));
     state.ensure().unwrap();
@@ -71,6 +80,20 @@ async fn controller_and_agent_over_iroh() {
         direct: vec![hint],
     }));
 
+    // A live TCP service, so the forward attempts below distinguish "the gate
+    // refused to route" from "the far side was closed anyway" — a forward to a
+    // dead port also carries no bytes, which is what makes that check vacuous.
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = echo.accept().await {
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+
     // ---- the gate: pending, and given nothing ----
     let pending = eventually("the agent to be recorded pending", || {
         state.pending().ok()?.into_iter().next()
@@ -97,6 +120,28 @@ async fn controller_and_agent_over_iroh() {
         );
     }
     assert!(!dir.path().join("nope").exists());
+
+    // The fourth thing an unapproved agent must not get is a port. The listener
+    // binds locally either way — the question is whether a byte crosses.
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (bound, task) = controller::forward_listener(
+            &state,
+            &agent_pk,
+            "127.0.0.1:0".parse().unwrap(),
+            echo_addr.to_string(),
+        )
+        .await
+        .unwrap();
+        let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let _ = c.write_all(b"should-not-echo").await;
+        let mut buf = [0u8; 15];
+        assert!(
+            c.read_exact(&mut buf).await.is_err(),
+            "an unapproved agent carried traffic to a live service"
+        );
+        task.abort();
+    }
 
     // ---- approve, and it becomes reachable without restarting anything ----
     assert!(state.approve(&agent_key).unwrap(), "first approval");
@@ -175,17 +220,29 @@ async fn controller_and_agent_over_iroh() {
     );
     assert!(!missing.exists());
 
+    // And a file that is there but cannot be read is NOT reported as missing.
+    // This is the distinction the ssh recipe rests on: a caller that reads,
+    // edits and writes back a remote authorized_keys must not treat "I could not
+    // read it" as "it was empty" and erase the target's existing keys.
+    let unreadable = dir.path().join("unreadable.bin");
+    std::fs::write(&unreadable, b"secret").unwrap();
+    std::fs::set_permissions(&unreadable, {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::Permissions::from_mode(0o000)
+    })
+    .unwrap();
+    let dest = dir.path().join("stolen.bin");
+    let e = controller::pull(&state, &agent_pk, unreadable.to_str().unwrap(), &dest)
+        .await
+        .expect_err("an unreadable file must not pull successfully");
+    let msg = format!("{e:#}");
+    assert!(
+        !msg.contains("has no "),
+        "an unreadable file was reported as missing, which is how a read-modify-write erases it: {msg}"
+    );
+    assert!(!dest.exists());
+
     // ---- forward: a local port carries bytes to a service on the target ----
-    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let echo_addr = echo.local_addr().unwrap();
-    tokio::spawn(async move {
-        while let Ok((mut s, _)) = echo.accept().await {
-            tokio::spawn(async move {
-                let (mut r, mut w) = s.split();
-                let _ = tokio::io::copy(&mut r, &mut w).await;
-            });
-        }
-    });
     let (bound, forwarding) = controller::forward_listener(
         &state,
         &agent_pk,

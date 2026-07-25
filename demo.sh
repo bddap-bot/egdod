@@ -81,7 +81,10 @@ echo "controller direct address: $DIRECT"
 
 say "3. reachability canary — the controller dials its own node id from a fresh key"
 wait_for 30 "grep -q '\"dialable\": true' '$STATE/status.json'"
-ctl status
+# Informational: `status` exits 2 when the controller is undialable, and a
+# single transient probe failure must not abort a demo that is about to prove
+# the canary works.
+ctl status || true
 
 say "4. agent starts, dials out, and is held pending (nothing is served to it)"
 "$BIN" agent --controller "$NODE_ID" --key-file "$DEMO/agent.key" \
@@ -114,6 +117,11 @@ if [ -e "$DEMO/target/probe.bin" ] || [ -e "$DEMO/stolen" ]; then
   echo "DEFECT: a file crossed to or from an unapproved agent" >&2; exit 1
 fi
 # forward only routes when something connects, so it is tested by connecting.
+# Note what this can and cannot show: nothing is listening on $SSHD_PORT yet, so
+# "no bytes came back" would also be true of a *working* forward. What it does
+# prove is the log line — the controller refused to route at all. The
+# discriminating version of this check, against a live listener, is in
+# tests/integration.rs, where standing one up costs nothing.
 "$BIN" controller --state-dir "$STATE" forward "$AGENT" 0 "127.0.0.1:$SSHD_PORT" \
   >"$DEMO/refused-fwd.log" 2>&1 &
 REFUSED_FWD=$!
@@ -123,14 +131,18 @@ RP=$(sed -n 's/^forwarding 127.0.0.1:\([0-9]*\).*/\1/p' "$DEMO/refused-fwd.log" 
 GOT=$(timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/$RP; head -c 16 <&3" || true)
 kill "$REFUSED_FWD" 2>/dev/null || true
 if [ -n "$GOT" ]; then echo "DEFECT: the forward carried data: $GOT" >&2; exit 1; fi
+if ! grep -q 'no agent is connected' "$DEMO/refused-fwd.log"; then
+  echo "DEFECT: the forward did not refuse to route" >&2; exit 1
+fi
 cat "$DEMO/refused.out"
+grep -m1 'no agent is connected' "$DEMO/refused-fwd.log"
 echo "exec, push, pull and forward all refused — the controller holds no session for an unapproved key"
 
 say "6. approve by public key (scriptable), and watch the session appear"
 ctl approve "$AGENT"
 cat "$STATE/approved"
-wait_for 30 "ctl status --json | grep -q '$AGENT'"
-ctl status
+wait_for 30 "grep -q '$AGENT' '$STATE/status.json'"
+ctl status || true
 
 say "7. PRIMITIVE exec — stdout and stderr stay separate, exit status comes back"
 set +e
@@ -210,7 +222,7 @@ kill "$SERVE_PID"; wait "$SERVE_PID" 2>/dev/null || true
 # how this script can tell the new controller apart from the dead one's remains.
 rm -f "$STATE/control.sock" "$STATE/status.json"
 serve_up
-wait_for 60 "ctl status --json | grep -q '$AGENT'"
+wait_for 60 "grep -q '$AGENT' '$STATE/status.json' 2>/dev/null"
 echo "reconnected without being approved again:"
 ctl exec "$AGENT" -- /bin/sh -c 'echo still-here'
 
@@ -222,7 +234,7 @@ if sudo -n true 2>/dev/null; then
   wait_for 30 "grep -q 'agent pubkey' '$DEMO/root-agent.log'"
   ROOT_AGENT=$(sed -n 's/^agent pubkey: //p' "$DEMO/root-agent.log" | head -1)
   ctl approve "$ROOT_AGENT"
-  wait_for 30 "ctl status --json | grep -q '$ROOT_AGENT'"
+  wait_for 30 "grep -q '$ROOT_AGENT' '$STATE/status.json'"
   echo "uid seen by exec: $(ctl exec "$ROOT_AGENT" -- id -u)"
   # Reads a root-only file without printing any of it.
   ctl exec "$ROOT_AGENT" -- head -c 0 /etc/shadow && echo "/etc/shadow is readable: exec really is root"
@@ -244,14 +256,18 @@ wait_for 60 "[ -s '$UND/status.json' ] && grep -qE '\"endpoint_restarts\": [1-9]
 grep -m3 -E "UNDIALABLE|rebuilding" "$DEMO/undialable.log"
 # `status` exits 2 on an undialable controller, which is the point of this step;
 # under `set -e` that has to be caught rather than treated as the script failing.
-"$BIN" controller --state-dir "$UND" status && {
-  echo "DEFECT: status reported success for an undialable controller" >&2; exit 1
+set +e
+"$BIN" controller --state-dir "$UND" status
+UND_RC=$?
+set -e
+[ "$UND_RC" = 2 ] || {
+  echo "DEFECT: an undialable controller's status exited $UND_RC, wanted 2" >&2; exit 1
 }
 echo "status exited 2 — a program can act on this without parsing prose"
 kill "${PIDS[-1]}" 2>/dev/null || true
 
 say "13. final controller status"
-ctl status --json
+ctl status --json || true
 
 say "14. controller log (paths reported for every session, canary results)"
 grep -E 'agent connected|routed a session|reachability|UNDIALABLE|pending' "$DEMO/serve.log" | tail -12
@@ -286,9 +302,9 @@ else
   wait_for 60 "grep -q 'agent pubkey' '$R/agent.log'"
   RAGENT=$(sed -n 's/^agent pubkey: //p' "$R/agent.log" | head -1)
   rctl approve "$RAGENT"
-  wait_for 120 "rctl status --json | grep -q '$RAGENT'"
+  wait_for 120 "grep -q '$RAGENT' '$RSTATE/status.json'"
   rctl exec "$RAGENT" -- /bin/sh -c 'echo hello-from-a-node-id-alone'
-  rctl status
+  rctl status || true
 
   say "16. the relayed label, and a session that stops being relayed"
   # Both ends are on one host, so holepunching always wins eventually and a

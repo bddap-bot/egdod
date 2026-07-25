@@ -32,8 +32,16 @@ const SHORT_RETRY: Duration = Duration::from_secs(1);
 const PENDING_RETRY: Duration = Duration::from_secs(5);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const EXEC_CHUNK: usize = 32 * 1024;
-/// How long exec output may go nowhere before it is declared stuck rather than slow.
-const DRAIN_STALL: Duration = Duration::from_secs(2);
+/// How long exec output may be entirely idle before the pipes are declared
+/// abandoned. Short on purpose: `exec sshd` leaves a daemon holding them, and
+/// every such command would otherwise wait this out before returning.
+const DRAIN_IDLE: Duration = Duration::from_secs(2);
+/// Backstop on the whole drain. Once the command has exited, the only output
+/// legitimately still owed is whatever sits in the two pipe buffers — at most a
+/// couple of hundred KiB, which is seconds even through a relay. Anything still
+/// arriving after this is a live writer the command left behind, not a drain,
+/// and waiting on it is waiting forever.
+const DRAIN_CAP: Duration = Duration::from_secs(15);
 
 pub struct Config {
     pub controller: EndpointId,
@@ -274,25 +282,29 @@ async fn exec(argv: Vec<String>, mut send: SendStream) -> Result<()> {
     let err = tokio::spawn(async move { pump_frames(&mut stderr, &err_tx, false).await });
     drop(tx);
 
-    // Counts frames that have actually reached the wire, which is what tells a
-    // slow link apart from a stalled one further down.
-    let written = Arc::new(AtomicU64::new(0));
-    let counter = written.clone();
+    let progress = Arc::new(Progress::default());
+    let mine = progress.clone();
     let writer = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
-            if let Err(e) = write_msg(&mut send, &frame).await {
+            mine.sending.store(true, Ordering::Relaxed);
+            let r = write_msg(&mut send, &frame).await;
+            mine.sending.store(false, Ordering::Relaxed);
+            if let Err(e) = r {
                 tracing::warn!("exec output stream broke: {e:#}");
                 return None;
             }
-            counter.fetch_add(1, Ordering::Relaxed);
+            mine.frames.fetch_add(1, Ordering::Relaxed);
         }
         Some(send)
     });
 
     let status = child.wait().await.context("waiting for child")?;
-    let truncated = drain_output(out, err, &written).await;
-    if let Ok(Some(mut send)) = writer.await {
-        if truncated {
+    let cut = drain_output(out, err, &progress).await;
+    // Bounded too: with the pumps aborted the writer's senders are gone, so it
+    // only has its current frame left to push, and if the peer has stopped
+    // reading entirely there is nothing useful left to say to it anyway.
+    if let Ok(Ok(Some(mut send))) = tokio::time::timeout(DRAIN_CAP, writer).await {
+        if cut {
             write_msg(&mut send, &ExecFrame::Truncated).await?;
         }
         write_msg(&mut send, &ExecFrame::Exit(exit_code(&status))).await?;
@@ -301,18 +313,32 @@ async fn exec(argv: Vec<String>, mut send: SendStream) -> Result<()> {
     Ok(())
 }
 
+/// What the output side is doing, so a drain can tell "nothing left to send"
+/// from "plenty left to send and the peer is slow".
+#[derive(Default)]
+struct Progress {
+    /// Frames handed to the stream since the command exited.
+    frames: AtomicU64,
+    /// Whether the writer is inside a send right now. Without this, a peer that
+    /// has stopped reading looks exactly like a pipe nobody will write to again.
+    sending: std::sync::atomic::AtomicBool,
+}
+
 /// Waits for the two output pumps to reach EOF after the command exited, and
 /// reports whether it gave up on them.
 ///
-/// It has to be bounded: a command that forks a process holding the same pipes
-/// never closes them, and the exit status would never arrive. But a bounded
-/// *total* wait silently truncates the output of anything that emits more than
-/// the link can carry in that window, so the deadline is against a *stall* — it
-/// resets every time a frame reaches the wire.
+/// This has to be bounded: `exec foo &`-style commands leave a daemon holding
+/// the same pipes, which are then never closed, and the exit status would never
+/// arrive. But bounding it on elapsed time alone throws away the output of
+/// anything still streaming, so the deadline only fires when the output side is
+/// genuinely idle — no frames sent and the writer not blocked mid-send. A slow
+/// controller keeps the writer blocked and buys more time; a daemon on the far
+/// end of an open pipe does not. `DRAIN_CAP` is the backstop for the case where
+/// the peer never reads again.
 async fn drain_output(
     out: tokio::task::JoinHandle<()>,
     err: tokio::task::JoinHandle<()>,
-    written: &AtomicU64,
+    progress: &Progress,
 ) -> bool {
     // Aborting is not the same as dropping: a dropped handle detaches its task,
     // which keeps that task's channel sender alive and the writer waiting forever.
@@ -320,13 +346,15 @@ async fn drain_output(
     let mut both = tokio::spawn(async move {
         let _ = tokio::join!(out, err);
     });
+    let give_up = tokio::time::Instant::now() + DRAIN_CAP;
     loop {
-        let before = written.load(Ordering::Relaxed);
-        if tokio::time::timeout(DRAIN_STALL, &mut both).await.is_ok() {
+        let before = progress.frames.load(Ordering::Relaxed);
+        if tokio::time::timeout(DRAIN_IDLE, &mut both).await.is_ok() {
             return false;
         }
-        if written.load(Ordering::Relaxed) == before {
-            tracing::warn!("exec output stalled after the command exited; cutting it off");
+        let idle = progress.frames.load(Ordering::Relaxed) == before
+            && !progress.sending.load(Ordering::Relaxed);
+        if idle || tokio::time::Instant::now() >= give_up {
             both.abort();
             for a in aborts {
                 a.abort();
