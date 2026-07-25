@@ -59,6 +59,12 @@ pub enum ExecFrame {
     Exit(i32),
     /// The command could not be run at all (as distinct from running and failing).
     Failed(String),
+    /// Output was cut off: the command exited but something still held its pipes
+    /// open and nothing more was moving. Sent before `Exit` so a caller can never
+    /// read an exit status as proof it saw the whole output. New variants go at
+    /// the end — postcard tags enums by position, so inserting one above would
+    /// silently reinterpret every other frame.
+    Truncated,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

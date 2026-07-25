@@ -19,6 +19,8 @@ use iroh::{EndpointId, SecretKey};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
@@ -30,6 +32,8 @@ const SHORT_RETRY: Duration = Duration::from_secs(1);
 const PENDING_RETRY: Duration = Duration::from_secs(5);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const EXEC_CHUNK: usize = 32 * 1024;
+/// How long exec output may go nowhere before it is declared stuck rather than slow.
+const DRAIN_STALL: Duration = Duration::from_secs(2);
 
 pub struct Config {
     pub controller: EndpointId,
@@ -48,14 +52,28 @@ enum Outcome {
 /// Never returns. A target has no screen and nobody to press a key on it, so
 /// every failure here is a sleep and another attempt.
 pub async fn run(cfg: Config) -> Result<()> {
-    // The agent keeps this across reboots so an approved target stays approved; on
-    // a tmpfs initramfs it is regenerated per boot and needs approving again, which
-    // is a property of the medium, not of this code.
-    let secret = load_or_create_key(&cfg.key_file, OnUnusable::Replace)?;
+    tracing::info!(controller = %cfg.controller, "egdod agent starting");
+
+    // Retried rather than propagated: the key file lives on whatever storage the
+    // target happened to boot with, and a filesystem that is not writable yet is
+    // exactly the kind of transient a screenless machine has to sit through.
+    // Returning an error here would exit the process with nobody to restart it.
+    //
+    // The agent keeps this key across reboots so an approved target stays
+    // approved; on a tmpfs initramfs it is regenerated per boot and needs
+    // approving again, which is a property of the medium, not of this code.
+    let secret = loop {
+        match load_or_create_key(&cfg.key_file, OnUnusable::Replace) {
+            Ok(s) => break s,
+            Err(e) => {
+                tracing::error!("cannot load or create the agent key: {e:#}");
+                tokio::time::sleep(MAX_BACKOFF).await;
+            }
+        }
+    };
     // stdout, not a log line: on a bare target this print is how the operator
     // learns which key to approve, e.g. from a serial console capture.
     println!("agent pubkey: {}", secret.public());
-    tracing::info!(controller = %cfg.controller, "egdod agent starting");
 
     let mut backoff = SHORT_RETRY;
     loop {
@@ -248,32 +266,66 @@ async fn exec(argv: Vec<String>, mut send: SendStream) -> Result<()> {
     let err = tokio::spawn(async move { pump_frames(&mut stderr, &err_tx, false).await });
     drop(tx);
 
+    // Counts frames that have actually reached the wire, which is what tells a
+    // slow link apart from a stalled one further down.
+    let written = Arc::new(AtomicU64::new(0));
+    let counter = written.clone();
     let writer = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             if let Err(e) = write_msg(&mut send, &frame).await {
                 tracing::warn!("exec output stream broke: {e:#}");
                 return None;
             }
+            counter.fetch_add(1, Ordering::Relaxed);
         }
         Some(send)
     });
 
     let status = child.wait().await.context("waiting for child")?;
-    // Bounded: a command that forks a process holding the same pipes would
-    // otherwise keep them open forever, and the exit status would never arrive.
-    let drain = Duration::from_secs(2);
-    // Aborted, not just abandoned: dropping the handle detaches the task, which
-    // would keep its channel sender alive and the writer waiting forever.
-    for mut task in [out, err] {
-        if tokio::time::timeout(drain, &mut task).await.is_err() {
-            task.abort();
-        }
-    }
+    let truncated = drain_output(out, err, &written).await;
     if let Ok(Some(mut send)) = writer.await {
+        if truncated {
+            write_msg(&mut send, &ExecFrame::Truncated).await?;
+        }
         write_msg(&mut send, &ExecFrame::Exit(exit_code(&status))).await?;
         send.finish()?;
     }
     Ok(())
+}
+
+/// Waits for the two output pumps to reach EOF after the command exited, and
+/// reports whether it gave up on them.
+///
+/// It has to be bounded: a command that forks a process holding the same pipes
+/// never closes them, and the exit status would never arrive. But a bounded
+/// *total* wait silently truncates the output of anything that emits more than
+/// the link can carry in that window, so the deadline is against a *stall* — it
+/// resets every time a frame reaches the wire.
+async fn drain_output(
+    out: tokio::task::JoinHandle<()>,
+    err: tokio::task::JoinHandle<()>,
+    written: &AtomicU64,
+) -> bool {
+    // Aborting is not the same as dropping: a dropped handle detaches its task,
+    // which keeps that task's channel sender alive and the writer waiting forever.
+    let aborts = [out.abort_handle(), err.abort_handle()];
+    let mut both = tokio::spawn(async move {
+        let _ = tokio::join!(out, err);
+    });
+    loop {
+        let before = written.load(Ordering::Relaxed);
+        if tokio::time::timeout(DRAIN_STALL, &mut both).await.is_ok() {
+            return false;
+        }
+        if written.load(Ordering::Relaxed) == before {
+            tracing::warn!("exec output stalled after the command exited; cutting it off");
+            both.abort();
+            for a in aborts {
+                a.abort();
+            }
+            return true;
+        }
+    }
 }
 
 async fn pump_frames<R: tokio::io::AsyncRead + Unpin>(
