@@ -9,8 +9,8 @@
 use crate::net::{self, Lookup, ProbeMode, RelayChoice};
 use crate::pipe::splice;
 use crate::proto::{
-    finish, hex, read_msg, read_msg_opt, recv_file_body, send_file_body, stat_and_hash, write_msg,
-    Ack, ExecFrame, PullStart, Request, Route, RouteReply, ALPN, CLOSE_PENDING,
+    finish, hex, read_msg, read_msg_opt, recv_file_body, send_file_body, set_mode, stat_and_hash,
+    write_msg, Ack, ExecFrame, PullStart, Request, Route, RouteReply, ALPN, CLOSE_PENDING,
     PROBE_ALPN, PROBE_PING, PROBE_PONG,
 };
 use crate::state::{now_unix, SessionInfo, StateDir, Status};
@@ -255,6 +255,20 @@ impl ProtocolHandler for Acceptor {
             },
         );
         publish_sessions(&self.sessions, &self.status).await;
+
+        // Republish as soon as the path changes rather than waiting for the next
+        // canary tick, so `status` cannot describe a session that holepunched (or
+        // fell back to the relay) minutes ago as still being on its first path.
+        let sessions = self.sessions.clone();
+        let status = self.status.clone();
+        let watched = conn.clone();
+        tokio::spawn(async move {
+            let mut changes = net::path_changes(watched);
+            while let Some((was, now, remote)) = changes.recv().await {
+                tracing::info!(agent = %peer, %was, %now, %remote, "session path changed");
+                publish_sessions(&sessions, &status).await;
+            }
+        });
 
         let sessions = self.sessions.clone();
         let status = self.status.clone();
@@ -703,11 +717,24 @@ pub fn approve(state: &StateDir, key: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn status(state: &StateDir, json: bool) -> Result<()> {
+/// Exit code when the controller is up but nobody can dial it. The spec wants
+/// this state *exposed*, and the intended operator is a program on a handset, so
+/// it has to be legible without parsing prose. A dead or never-probed controller
+/// is the same answer: do not ship an image pointed at this node id yet.
+pub const EXIT_UNDIALABLE: i32 = 2;
+
+/// Returns the process exit code, so an unattended controller can be checked
+/// with `egdod controller status >/dev/null || wait`.
+pub fn status(state: &StateDir, json: bool) -> Result<i32> {
     let s = state.read_status()?;
+    let code = if s.dialable == Some(true) && s.writer_alive() {
+        0
+    } else {
+        EXIT_UNDIALABLE
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&s)?);
-        return Ok(());
+        return Ok(code);
     }
     println!("node id:   {}", s.node_id);
     println!(
@@ -738,7 +765,7 @@ pub fn status(state: &StateDir, json: bool) -> Result<()> {
     if s.sessions.is_empty() {
         println!("agent:     none connected");
     }
-    Ok(())
+    Ok(code)
 }
 
 /// Runs argv on the target and collects its output instead of streaming it to a
@@ -784,11 +811,4 @@ pub async fn push_bytes(
     set_mode(scratch, mode).await?;
     push_file(state, agent, scratch, remote).await?;
     Ok(())
-}
-
-async fn set_mode(path: &Path, mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-        .await
-        .with_context(|| format!("setting mode on {}", path.display()))
 }
