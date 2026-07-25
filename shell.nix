@@ -20,6 +20,9 @@ pkgs.mkShell {
   # stdenv's CC/CXX/AR and poisons host builds. Referenced by store path only.
   nativeBuildInputs = with pkgs; [ rust pkg-config perl openssh ];
   # ring compiles C for the musl target; point cc at the cross toolchain.
+  # NOTE: if RUSTC_WRAPPER is a build accelerator (sccache/kache/…), cc-rs
+  # prefixes it onto this compiler too, so unset RUSTC_WRAPPER for the musl
+  # build if your wrapper rejects a cross compiler's argv (kache does).
   CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "${musl-gcc}/bin/x86_64-unknown-linux-musl-gcc";
   CC_x86_64_unknown_linux_musl = "${musl-gcc}/bin/x86_64-unknown-linux-musl-gcc";
 }
