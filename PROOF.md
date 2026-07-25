@@ -261,6 +261,48 @@ egdod: session with d6ca9ed5... via direct-local (127.0.0.1:56871)
 exec-with-no-resolver
 ```
 
+### The demo leaves nothing behind
+
+It installs an ssh key and starts an sshd. On a machine that is somebody's
+actual computer, a demo that leaves either behind is a backdoor, so every key
+and file it creates lives under one `mktemp -d` scratch directory which is
+removed on every exit path — and the removal is checked, not assumed. The last
+thing a run prints is what it left:
+
+```
+=== cleanup: what this run left on the machine
+/root/.ssh/authorized_keys: unchanged (a0370156d0e729127533fd7d30ac595a63787123e9f2b4f2cd48a77adc86429e)
+scratch directory removed: /tmp/nix-shell-2909619-2289422015/egdod-demo.27D9m7
+no egdod or sshd processes left from this run
+nothing installed by this run remains on the machine
+```
+
+The real `/root/.ssh/authorized_keys` is never a target — the recipe's default
+is overridden to a file under the scratch directory — but its digest is taken
+before and after regardless, because "we passed a flag" is an argument and a
+digest is evidence. Verified independently of the script, from outside it:
+
+```
+BEFORE: a0370156d0e729127533fd7d30ac595a63787123e9f2b4f2cd48a77adc86429e
+AFTER:  a0370156d0e729127533fd7d30ac595a63787123e9f2b4f2cd48a77adc86429e
+```
+
+**An EXIT trap alone was not enough, and this was found the hard way.** The
+script is normally run inside `nix-shell`; killing the wrapper leaves the script
+orphaned but running, and a `SIGKILL` on the script itself runs no trap at all
+— which would strand an sshd listening with a freshly installed key. There is
+now a `setsid`-detached janitor that waits for the script's pid to disappear and
+reaps whatever is left, so the guarantee does not depend on this shell
+surviving. Tested by `SIGKILL`ing the script mid-run, which no trap can catch:
+
+```
+demo.sh pid=2907307 — SIGKILL (no trap can possibly run)
+waiting for the janitor...
+AFTER:  a0370156d0e729127533fd7d30ac595a63787123e9f2b4f2cd48a77adc86429e
+leftover procs:   0
+leftover sshd:    0
+```
+
 ### No secret in the image
 
 ```

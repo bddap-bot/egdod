@@ -26,8 +26,25 @@ SSHD=$(command -v sshd)
 SSHD_PORT=${EGDOD_DEMO_SSHD_PORT:-2299}
 PIDS=()
 
-cleanup() {
-  for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done
+# This script installs an ssh key and starts an sshd. On a machine that is
+# somebody's actual computer, a demo that leaves either behind is not a demo,
+# it is a backdoor — so every key and file goes inside $DEMO and $DEMO is
+# removed on EVERY exit path, success or failure or early abort, and the removal
+# is then CHECKED rather than assumed.
+#
+# The real root authorized_keys is never a target: the recipe's default is
+# overridden to a file under $DEMO (step 9). We record its digest anyway and
+# compare afterwards, because "we passed a flag" is an argument and a digest is
+# evidence.
+ak_digest() { # the real root authorized_keys, however it is readable
+  local f=/root/.ssh/authorized_keys
+  if sudo -n test -r "$f" 2>/dev/null; then sudo -n sha256sum "$f" | cut -d' ' -f1
+  elif [ -r "$f" ]; then sha256sum "$f" | cut -d' ' -f1
+  else echo "absent-or-unreadable"; fi
+}
+AK_BEFORE=$(ak_digest)
+
+reap() { # kill everything this run started, and delete its scratch
   [ -f "$DEMO/sshd/sshd.pid" ] && kill "$(cat "$DEMO/sshd/sshd.pid")" 2>/dev/null || true
   # Backstop: anything still running that was started against this run's unique
   # scratch directory, including processes reparented to init.
@@ -37,6 +54,55 @@ cleanup() {
   # removal is allowed to fail before the privileged one finishes the job.
   rm -rf "$DEMO" 2>/dev/null || sudo -n rm -rf "$DEMO" 2>/dev/null || true
 }
+
+# A trap is not enough. This script is normally run inside `nix-shell`, and
+# killing that killed the whole process group without bash ever running its EXIT
+# trap — which left an sshd listening with a freshly installed key on it. That
+# is a backdoor, not a demo, so the guarantee cannot depend on this shell
+# surviving. The janitor is `setsid`-detached, so a group kill misses it; it
+# waits for this process to disappear and then reaps whatever is left.
+setsid bash -c '
+  while kill -0 '"$$"' 2>/dev/null; do sleep 1; done
+  sleep 1
+  [ -f "'"$DEMO"'/sshd/sshd.pid" ] && kill "$(cat "'"$DEMO"'/sshd/sshd.pid")" 2>/dev/null
+  pkill -f "'"$DEMO"'" 2>/dev/null
+  sudo -n pkill -f "'"$DEMO"'" 2>/dev/null
+  rm -rf "'"$DEMO"'" 2>/dev/null || sudo -n rm -rf "'"$DEMO"'" 2>/dev/null
+  exit 0
+' >/dev/null 2>&1 </dev/null &
+disown 2>/dev/null || true
+
+CLEANED=0
+cleanup() {
+  [ "$CLEANED" = 1 ] && return 0
+  CLEANED=1
+  for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done
+  reap
+
+  printf '\n=== cleanup: what this run left on the machine\n'
+  local bad=0
+  local after; after=$(ak_digest)
+  if [ "$after" = "$AK_BEFORE" ]; then
+    echo "/root/.ssh/authorized_keys: unchanged ($AK_BEFORE)"
+  else
+    echo "DEFECT: /root/.ssh/authorized_keys CHANGED: $AK_BEFORE -> $after" >&2; bad=1
+  fi
+  if [ -e "$DEMO" ]; then
+    echo "DEFECT: scratch directory survived: $DEMO" >&2
+    ls -la "$DEMO" >&2 || true; bad=1
+  else
+    echo "scratch directory removed: $DEMO"
+  fi
+  local left; left=$(pgrep -af "$DEMO" 2>/dev/null || true)
+  if [ -n "$left" ]; then echo "DEFECT: processes still running: $left" >&2; bad=1
+  else echo "no egdod or sshd processes left from this run"; fi
+  [ "$bad" = 0 ] && echo "nothing installed by this run remains on the machine"
+}
+# INT and TERM as well as EXIT: bash does not run an EXIT trap for an untrapped
+# fatal signal, and ctrl-c during a 64 MiB copy is exactly when someone would
+# most want the sshd and the installed key to go away. `cleanup` runs at most
+# once, so the two traps overlapping is harmless.
+trap 'exit 130' INT TERM
 trap cleanup EXIT
 
 say() { printf '\n=== %s\n' "$*"; }
