@@ -31,3 +31,24 @@ observed working rather than merely intended.
 ## License
 
 Dual MIT / Apache-2.0, at your option.
+
+## Try it
+
+```sh
+nix-shell --run ./demo.sh          # stands up both sides here and exercises everything
+```
+
+By hand:
+
+```sh
+egdod controller init                                  # prints the node id; bake that into the image
+egdod controller serve &                               # long-lived
+egdod agent --controller <nodeid>                      # on the target; prints its own pubkey
+egdod controller pending --json                        # the key waiting to be let in
+egdod controller approve <agent-pubkey>
+egdod controller exec <agent> -- uname -a
+egdod controller ssh  <agent>
+```
+
+`nix-build musl.nix` cross-builds the static agent — but read the failure section
+in `PROOF.md` before trusting it.
