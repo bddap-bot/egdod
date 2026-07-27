@@ -316,6 +316,52 @@ The agent's entire configuration is `--controller <node id>` plus addressing
 flags. It generates its own keypair on first run and prints only the public
 half. Nothing secret is given to it, so nothing secret can be taken from it.
 
+### The static agent completes the whole loop (property 4)
+
+This was the spec failure this file used to carry. Upstream `noq-udp` (iroh's
+UDP layer) sets `SO_TIMESTAMPNS` unconditionally on Linux and decodes the
+resulting `SCM_TIMESTAMPNS` control message as a `libc::timespec` through a
+helper asserting `align_of::<timespec>() <= align_of::<cmsghdr>()`. glibc gives
+`cmsghdr` 8-byte alignment and the assertion holds; musl gives it 4 and the
+static binary aborted on the first datagram it received. Reproduced on demand
+(2026-07-27) by running the unpatched static build against a blackhole
+controller address and feeding its bound UDP port one datagram from
+`/dev/udp`:
+
+```
+thread 'tokio-rt-worker' (291251) panicked at /build/cargo-vendor-dir/noq-udp-1.1.0/src/cmsg/mod.rs:81:5:
+assertion failed: align_of::<T>() <= align_of::<C>()
+...
+timeout: the monitored command dumped core   # rc=134
+```
+
+The fix is the vendored `vendor/noq-udp/` (crates.io 1.1.0 with unaligned cmsg
+reads/writes and the asserts removed — `VENDOR.md` there has the provenance and
+the exact deviation), applied via `[patch.crates-io]`. The same one-datagram
+experiment against the patched build: no panic, the process ran until killed.
+That settles what the previous revision of this file could only infer — the
+unaligned read is *sufficient*, not merely the first thing in the way.
+
+Sufficiency for the actual job was then demonstrated end to end: `demo.sh`
+step 18 no longer settles for "did not abort" — it requires the fresh musl key
+to be held pending, approves it, and execs through the static binary:
+
+```
+=== 18. the static agent — the binary this is supposed to boot on
+/nix/store/3ggrv26zpdy17dlbf1lb5m6a0q8d7waw-...-musl-0.1.0/bin/egdod: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), static-pie linked, not stripped
+approved e987a6cf1be7e5fbb30fc34536e25aac5307fe34b601cdba2aba677153810476
+the static binary connected, was approved, and served an exec:
+  static-agent-served-exec
+
+=== demo complete: every claim above was exercised, including the static agent
+```
+
+The regression is pinned twice: step 18 turns a returning abort back into a
+GAP, and the vendored crate carries unit tests (`cargo test --manifest-path
+vendor/noq-udp/Cargo.toml --lib`) that decode and encode through a musl-shaped
+align-4 cmsghdr with a deliberately misaligned `timespec` payload — verified to
+fail against the upstream code and pass against the patch.
+
 ## What the agent needs from its environment
 
 `SPEC.md` property 4 asks for this to be written down here, and made explicit on
@@ -357,42 +403,7 @@ anything specified:
   `127.0.0.1:22`) and the flags exist so the demo can point it at an
   unprivileged sshd instead.
 
-## NOT PROVED — and one of these is a spec failure
-
-### The static agent does not work. Property 4 is not met.
-
-`nix-build musl.nix` produces a genuine static binary, and `--version` runs:
-
-```
-/tmp/egdod-musl-result/bin/egdod: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), static-pie linked, not stripped
-$ env -i ./egdod --version
-egdod 0.1.0
-```
-
-It aborts on the first datagram it receives, so it has never completed a
-connection. Reproduced three times, and `demo.sh` step 18 now runs it rather
-than describing it:
-
-```
-GAP: the static binary aborts on its first datagram (rc=134):
-thread 'tokio-rt-worker' panicked at /build/cargo-vendor-dir/noq-udp-1.1.0/src/cmsg/mod.rs:81:5:
-assertion failed: align_of::<T>() <= align_of::<C>()
-```
-
-Root cause, read in the dependency's source rather than guessed at: `noq-udp`
-(iroh's UDP layer) sets `SO_TIMESTAMPNS` unconditionally on Linux
-(`src/unix.rs:140`) and decodes the resulting `SCM_TIMESTAMPNS` control message
-as a `libc::timespec` (`src/unix.rs:784`), through a helper that asserts
-`align_of::<timespec>() <= align_of::<cmsghdr>()` (`src/cmsg/mod.rs:81`). glibc
-gives `cmsghdr` 8-byte alignment and the assertion holds; musl gives it 4 and it
-does not. This is a bug in a dependency, not in egdod, and the fix belongs
-upstream — an unaligned read instead of an aligned one. Working around it here
-means vendoring a 3,550-line fork of a networking crate, which was judged worse
-than saying this plainly.
-
-Every claim under PROVED was therefore demonstrated on a machine with a distro
-on it. The binary intended for a machine without one has never talked to
-anything.
+## NOT PROVED
 
 ### Not tested at all
 
@@ -431,11 +442,6 @@ anything.
 Beliefs with reasons and no observation behind them. Each is a candidate for the
 next round of proving.
 
-- **The `cmsghdr` alignment difference is the whole musl story.** The assertion,
-  both struct definitions and the socket option were read in the dependency's
-  source, and the failure reproduces exactly where that predicts. But no patched
-  build was made, so it is not established that fixing the alignment is
-  *sufficient* — only that it is the first thing in the way.
 - **exec's drain behaves under a genuinely slow controller.** The three shapes
   that matter were measured (see PROVED above), but all of them on loopback. The
   case the drain is really designed for — a controller reading slowly enough

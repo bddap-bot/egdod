@@ -1,0 +1,39 @@
+{
+  "about": "Touched-path → test-suite map (bothouse#236), read by `botq test-map`. The acceptance gate derives every landed job's touched paths from its own diff and requires the commands mapped here green — independent of the job's brief. First matching rule wins: specific rules above broad ones. `tests: []` means CONSCIOUSLY untested and must carry its why. An unmapped path fails the resolver loud. Commands run from the repo root; lint completeness with `botq test-map --check`.",
+  "rules": [
+    {
+      "paths": ["test-map.json"],
+      "tests": ["botq test-map --check"],
+      "why": "editing the map re-lints its own completeness over every tracked file"
+    },
+    {
+      "paths": ["**/*.md", "**/LICENSE-*", ".gitignore"],
+      "tests": [],
+      "why": "prose and licenses"
+    },
+    {
+      "paths": ["demo.sh"],
+      "tests": ["bash -n demo.sh"],
+      "why": "the live proof harness — a full run needs a controller, sudo netns and the public relay, so the gate checks syntax only; run `nix-shell --run './demo.sh'` manually when touching it"
+    },
+    {
+      "paths": ["shell.nix"],
+      "tests": [],
+      "why": "the pinned dev environment — every cargo command below runs inside it, so a break fails those loudly"
+    },
+    {
+      "paths": ["vendor/**", "musl.nix", "Cargo.toml", "Cargo.lock"],
+      "tests": [
+        "nix-shell --run 'cargo test --manifest-path vendor/noq-udp/Cargo.toml --lib'",
+        "nix-shell --run 'cargo test'",
+        "nix-build musl.nix -o result-gate"
+      ],
+      "why": "the vendored noq-udp patch, the [patch.crates-io] wiring and the lockfile exist for the static musl agent (SPEC property 4, egdod#3) — so besides both native suites, the cross build itself must still produce a binary; nix caches it by input hash"
+    },
+    {
+      "paths": ["src/**", "tests/**"],
+      "tests": ["nix-shell --run 'cargo test'"],
+      "why": "the package's own suite; musl-specific breakage lives in libc-facing deps (covered by the vendor rule), not here"
+    }
+  ]
+}

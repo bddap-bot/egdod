@@ -52,8 +52,11 @@ egdod controller exec <agent> -- uname -a
 egdod controller ssh  <agent>
 ```
 
-`nix-build musl.nix` cross-builds the static agent — but read the failure section
-in `PROOF.md` before trusting it.
+`nix-build musl.nix` cross-builds the static agent. It carries a one-file
+vendored patch of iroh's UDP layer (`vendor/noq-udp/`, see its `VENDOR.md`):
+upstream decodes cmsg payloads with aligned reads behind an alignment assert
+that musl's 4-byte-aligned `cmsghdr` fails, which aborted the static binary on
+its first received datagram (egdod#3).
 
 ## License
 
