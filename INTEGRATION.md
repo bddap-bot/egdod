@@ -61,7 +61,10 @@ the result is worth.
   a program on a handset; it should not have to parse prose.
 - **Running the static binary instead of describing it.** `impl/kimi`'s musl
   phase ran `file` on an artifact it never executed, and passed when the
-  artifact was absent. Step 18 now runs it — and it aborts.
+  artifact was absent. Step 18 now runs it — and the abort that surfaced
+  (noq-udp's cmsg alignment assert, egdod#3) is fixed by the vendored patch in
+  `vendor/noq-udp/`; the step now requires the static binary to be approved and
+  serve an exec.
 
 ## Rejected
 
@@ -87,11 +90,6 @@ ask for revocation and it was left alone rather than half-built.
 
 ## Still missing against the spec
 
-- **Property 4 is not met.** The static musl agent builds and aborts on its
-  first datagram — an alignment assertion in iroh's UDP layer that holds on
-  glibc and not on musl. Root cause in `PROOF.md`; the fix is upstream, and
-  vendoring a 3,550-line fork of a networking crate to force it was judged worse
-  than saying so. Everything proved was proved with the glibc build.
 - **Nothing has been tested across two machines.** Both ends of every session
   were on one host, so NAT traversal — the reason the agent dials out — rests on
   the prior art rather than on this code.

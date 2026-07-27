@@ -1,3 +1,5 @@
 /target
 /result*
 **/*.rs.bk
+*.log
+vendor/noq-udp/Cargo.lock

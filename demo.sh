@@ -428,25 +428,39 @@ MUSL=${EGDOD_MUSL_BIN:-}
 if [ -x "$MUSL" ]; then
   file "$MUSL"
   M=$DEMO/musl; mkdir -p "$M"
+  # Not merely "does it stay alive": the fresh key must be held pending, get
+  # approved, and serve an exec — the same loop every glibc phase above ran.
+  # noq-udp's aligned cmsg reads used to abort this binary on its first
+  # received datagram (egdod#3, vendor/noq-udp/VENDOR.md), which the align_of
+  # branch below still detects if it ever comes back.
+  "$MUSL" agent --controller "$NODE_ID" --key-file "$M/agent.key" \
+    --no-relay --direct "$DIRECT" >"$M/agent.log" 2>&1 &
+  PIDS+=("$!")
   set +e
-  timeout 20 "$MUSL" agent --controller "$NODE_ID" --key-file "$M/agent.key" \
-    --no-relay --direct "$DIRECT" >"$M/agent.log" 2>&1
-  MUSL_RC=$?
+  wait_for 15 "grep -q 'agent pubkey:' '$M/agent.log'"
+  MUSL_PK=$(sed -n 's/^agent pubkey: //p' "$M/agent.log" | head -1)
+  wait_for 20 "ctl pending --json | grep -q \"$MUSL_PK\""
+  ctl approve "$MUSL_PK"
+  # PENDING_RETRY is 5s; give the redial and the exec a few attempts.
+  MUSL_OUT=
+  for _ in 1 2 3 4 5 6; do
+    MUSL_OUT=$(ctl exec "$MUSL_PK" -- /bin/sh -c 'echo static-agent-served-exec' 2>>"$M/exec.err")
+    [ "$MUSL_OUT" = static-agent-served-exec ] && break
+    sleep 5
+  done
   set -e
   if grep -q 'align_of' "$M/agent.log"; then
     GAPS=1
-    echo "GAP: the static binary aborts on its first datagram (rc=$MUSL_RC):"
+    echo "GAP: the static binary aborted on a received datagram — the noq-udp"
+    echo "     cmsg alignment bug (egdod#3) is back:"
     grep -m2 -E 'panicked|assertion' "$M/agent.log"
-    echo "     musl aligns struct cmsghdr to 4 bytes where the kernel lays out"
-    echo "     cmsg payloads at 8; iroh's UDP layer sets SO_TIMESTAMPNS and"
-    echo "     decodes SCM_TIMESTAMPNS as a struct timespec, whose alignment"
-    echo "     assertion then fails. This is a dependency bug, not an egdod one,"
-    echo "     and it means property 4 of SPEC.md is NOT met."
-  elif [ "$MUSL_RC" = 124 ]; then
-    echo "the static binary ran for 20s without aborting"
-    grep -m2 -E 'connected|path' "$M/agent.log" || true
+  elif [ "$MUSL_OUT" = static-agent-served-exec ]; then
+    echo "the static binary connected, was approved, and served an exec:"
+    echo "  $MUSL_OUT"
   else
-    echo "the static binary exited rc=$MUSL_RC:"; tail -5 "$M/agent.log"
+    GAPS=1
+    echo "GAP: the static binary ran but never served an exec; agent.log tail:"
+    tail -5 "$M/agent.log"
   fi
 else
   GAPS=1

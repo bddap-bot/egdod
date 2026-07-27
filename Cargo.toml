@@ -7,8 +7,19 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/bddap-bot/egdod"
 
 # Standalone package: the empty table stops cargo walking up into an unrelated
-# parent workspace if this repo is checked out inside one.
+# parent workspace if this repo is checked out inside one. `vendor` is excluded
+# so the patched crate stays a plain path dependency — its dev-deps (criterion)
+# never enter our lockfile.
 [workspace]
+exclude = ["vendor"]
+
+# egdod#3: upstream noq-udp asserts align_of::<payload> <= align_of::<cmsghdr>
+# and does aligned cmsg reads; musl declares cmsghdr with align 4 (glibc: 8),
+# so the static agent aborted on its first received datagram. The vendored
+# copy is crates.io 1.1.0 with unaligned cmsg reads/writes — see
+# vendor/noq-udp/VENDOR.md. Drop the whole vendor dir once upstream ships the fix.
+[patch.crates-io]
+noq-udp = { path = "vendor/noq-udp" }
 
 [dependencies]
 iroh = "1"
