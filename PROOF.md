@@ -348,8 +348,8 @@ to be held pending, approves it, and execs through the static binary:
 
 ```
 === 18. the static agent — the binary this is supposed to boot on
-/nix/store/3ggrv26zpdy17dlbf1lb5m6a0q8d7waw-...-musl-0.1.0/bin/egdod: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), static-pie linked, not stripped
-approved e987a6cf1be7e5fbb30fc34536e25aac5307fe34b601cdba2aba677153810476
+/nix/store/vjr7zx783n1f5dghf3vyl55xpm1d2cfi-...-musl-0.1.0/bin/egdod: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), static-pie linked, not stripped
+approved e9cdd8b67a602150f1500d833b63a388adefb5256645d1dbf9a87ab385d8e3c5
 the static binary connected, was approved, and served an exec:
   static-agent-served-exec
 

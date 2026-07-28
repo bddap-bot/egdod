@@ -29,8 +29,9 @@ Early, and the first paragraph above is the intent rather than the achievement. 
 three primitives, approval by public key, and the ssh recipe, all over real iroh connections — and
 separately, a target that knows only a node id finding its controller through a public relay. See
 `PROOF.md`, which separates what was watched happening from what is merely believed, and is careful
-about which of those ran where. What does not work yet is the boot: the static binary meant for a
-machine with no userland aborts on its first packet, and there is no image to put it on. `SPEC.md`
+about which of those ran where. The static binary meant for a machine with no userland completes
+that same loop (`PROOF.md`, demo step 18). What does not work yet is the boot: there is no image to
+put it on, and nothing has been tested across two machines. `SPEC.md`
 is the contract; `INTEGRATION.md` says how two competing implementations became this one, and what
 is still owed.
 
