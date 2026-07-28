@@ -9,11 +9,16 @@ let
   };
   pkgs = import nixpkgs { };
   musl = pkgs.pkgsCross.musl64;
+  # Prose, the demo harness, and repo metadata are not build inputs: including
+  # them made every doc commit invalidate this (minutes-long) cross build.
   src = pkgs.lib.cleanSourceWith {
     src = ./.;
     filter = path: type:
       let base = baseNameOf (toString path);
-      in pkgs.lib.cleanSourceFilter path type && base != "target" && base != "result";
+      in pkgs.lib.cleanSourceFilter path type
+         && base != "target" && base != "result"
+         && base != "demo.sh" && base != "test-map.json" && base != ".gitignore"
+         && !(pkgs.lib.hasSuffix ".md" base);
   };
 in
 musl.rustPlatform.buildRustPackage {

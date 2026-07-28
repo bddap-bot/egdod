@@ -453,14 +453,14 @@ if [ -x "$MUSL" ]; then
     GAPS=1
     echo "GAP: the static binary aborted on a received datagram — the noq-udp"
     echo "     cmsg alignment bug (egdod#3) is back:"
-    grep -m2 -E 'panicked|assertion' "$M/agent.log"
+    grep -m2 -E 'panicked|assertion' "$M/agent.log" || true
   elif [ "$MUSL_OUT" = static-agent-served-exec ]; then
     echo "the static binary connected, was approved, and served an exec:"
     echo "  $MUSL_OUT"
   else
     GAPS=1
-    echo "GAP: the static binary ran but never served an exec; agent.log tail:"
-    tail -5 "$M/agent.log"
+    echo "GAP: the static binary ran but never served an exec; log tails:"
+    tail -5 "$M/agent.log" "$M/exec.err" 2>/dev/null || true
   fi
 else
   GAPS=1
