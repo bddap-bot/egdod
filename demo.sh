@@ -439,15 +439,15 @@ if [ -x "$MUSL" ]; then
   set +e
   wait_for 15 "grep -q 'agent pubkey:' '$M/agent.log'"
   MUSL_PK=$(sed -n 's/^agent pubkey: //p' "$M/agent.log" | head -1)
-  wait_for 20 "ctl pending --json | grep -q \"$MUSL_PK\""
-  ctl approve "$MUSL_PK"
-  # PENDING_RETRY is 5s; give the redial and the exec a few attempts.
   MUSL_OUT=
-  for _ in 1 2 3 4 5 6; do
+  if [ -n "$MUSL_PK" ]; then
+    wait_for 20 "ctl pending --json | grep -q '$MUSL_PK'"
+    ctl approve "$MUSL_PK"
+    # The same wait every glibc phase uses: the session shows up in status.json,
+    # then a single exec.
+    wait_for 30 "grep -q '$MUSL_PK' '$STATE/status.json'"
     MUSL_OUT=$(ctl exec "$MUSL_PK" -- /bin/sh -c 'echo static-agent-served-exec' 2>>"$M/exec.err")
-    [ "$MUSL_OUT" = static-agent-served-exec ] && break
-    sleep 5
-  done
+  fi
   set -e
   if grep -q 'align_of' "$M/agent.log"; then
     GAPS=1

@@ -19,4 +19,5 @@ implementation for every libc — no glibc/musl cfg forks.
 
 Delete this whole directory and the `[patch.crates-io]` entry as soon as
 upstream (github.com/n0-computer/noq) ships an unaligned-read fix in a released
-`noq-udp` and `cargo update -p noq-udp` pulls it.
+`noq-udp` and `cargo update -p noq-udp` pulls it. Nobody has reported the bug
+upstream yet — that, and the eventual deletion, are tracked in egdod#6.
