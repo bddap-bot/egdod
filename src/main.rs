@@ -132,6 +132,13 @@ enum ControllerCmd {
         /// Local port for the forward; 0 picks a free one.
         #[arg(long, default_value_t = 0)]
         local_port: u16,
+        /// Options prefixed to the installed authorized_keys line; the default
+        /// pins the key to the target's loopback, where the forward exits.
+        #[arg(long, default_value = r#"from="127.0.0.1,::1""#)]
+        key_options: String,
+        /// `expiry-time=` on the installed line, by the target's clock.
+        #[arg(long, default_value_t = 600)]
+        key_ttl_secs: u64,
         /// Everything after `--` is passed to ssh.
         #[arg(last = true)]
         ssh_argv: Vec<String>,
@@ -222,6 +229,8 @@ async fn run_controller(state: StateDir, cmd: ControllerCmd) -> Result<()> {
             keygen_arg,
             target_addr,
             local_port,
+            key_options,
+            key_ttl_secs,
             ssh_argv,
         } => {
             let cfg = ssh::Config {
@@ -234,6 +243,8 @@ async fn run_controller(state: StateDir, cmd: ControllerCmd) -> Result<()> {
                 target_addr,
                 local_port,
                 ssh_argv,
+                key_options,
+                key_ttl: std::time::Duration::from_secs(key_ttl_secs),
             };
             let code = ssh::run(&state, cfg).await?;
             std::process::exit(code);

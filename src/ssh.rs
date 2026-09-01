@@ -11,7 +11,7 @@ use crate::state::StateDir;
 use anyhow::{bail, Context, Result};
 use std::net::SocketAddr;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 
 pub struct Config {
@@ -29,6 +29,12 @@ pub struct Config {
     pub target_addr: String,
     pub local_port: u16,
     pub ssh_argv: Vec<String>,
+    /// Prefixed to the installed line. Nothing ever removes that line, so the
+    /// default pins it to the target's own loopback, where the forward exits:
+    /// useless to anyone not already on the target.
+    pub key_options: String,
+    /// `expiry-time=` on the same line, judged by the target's clock.
+    pub key_ttl: Duration,
 }
 
 pub async fn run(state: &StateDir, cfg: Config) -> Result<i32> {
@@ -47,7 +53,10 @@ pub async fn run(state: &StateDir, cfg: Config) -> Result<i32> {
     // stage over each other.
     let scratch = state.ssh_dir().join(format!("scratch.{}", std::process::id()));
 
-    install_authorized_key(state, &cfg, &pubkey_line, &scratch).await?;
+    let blob = key_blob(&pubkey_line)
+        .with_context(|| format!("{} is not an ssh public key", pubkey.display()))?;
+    let line = authorized_line(&cfg.key_options, SystemTime::now() + cfg.key_ttl, &pubkey_line);
+    install_authorized_key(state, &cfg, blob, &line, &scratch).await?;
     let host_key = fetch_host_key(state, &cfg, &scratch).await?;
 
     let local: SocketAddr = ([127, 0, 0, 1], cfg.local_port).into();
@@ -113,27 +122,63 @@ fn ensure_local_key(key: &Path) -> Result<()> {
     Ok(())
 }
 
-/// pull + edit + push: the authorized_keys file the target already has is
-/// preserved, which matters when the recipe is run twice or alongside anything
-/// else that put a key there.
+fn key_blob(pubkey_line: &str) -> Option<&str> {
+    pubkey_line.split_whitespace().nth(1)
+}
+
+fn authorized_line(options: &str, expiry: SystemTime, pubkey_line: &str) -> String {
+    format!("{options},expiry-time={} {pubkey_line}", utc_yyyymmddhhmm(expiry))
+}
+
+/// The `Z` form: without it sshd judges the stamp in the target's local zone,
+/// which an initramfs does not have.
+fn utc_yyyymmddhhmm(t: SystemTime) -> String {
+    let secs = t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    let (hh, mm) = (rem / 3600, rem % 3600 / 60);
+    let (y, m, d) = civil_from_days(days as i64);
+    format!("{y:04}{m:02}{d:02}{hh:02}{mm:02}Z")
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
+}
+
+/// Every line carrying this key blob is dropped before the new one goes in, so
+/// a rerun renews the expiry instead of stacking a line per run.
+fn merge_authorized_keys(existing: &str, blob: &str, line: &str) -> String {
+    let mut body: String = existing
+        .lines()
+        .filter(|l| !l.split_whitespace().any(|f| f == blob))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    body.push_str(line);
+    body.push('\n');
+    body
+}
+
+/// pull + edit + push: whatever else the target's authorized_keys holds is
+/// preserved.
 async fn install_authorized_key(
     state: &StateDir,
     cfg: &Config,
+    blob: &str,
     line: &str,
     scratch: &Path,
 ) -> Result<()> {
     let existing = controller::pull_bytes(state, &cfg.agent, &cfg.authorized_keys, scratch).await?;
-    let mut body = existing
+    let existing = existing
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default();
-    if body.lines().any(|l| l.trim() == line) {
-        return Ok(());
-    }
-    if !body.is_empty() && !body.ends_with('\n') {
-        body.push('\n');
-    }
-    body.push_str(line);
-    body.push('\n');
+    let body = merge_authorized_keys(&existing, blob, line);
     controller::push_bytes(
         state,
         &cfg.agent,
@@ -144,7 +189,7 @@ async fn install_authorized_key(
     )
     .await
     .context("installing the authorized key")?;
-    eprintln!("egdod: installed an authorized key at {}", cfg.authorized_keys);
+    eprintln!("egdod: installed at {}: {line}", cfg.authorized_keys);
     Ok(())
 }
 
@@ -218,4 +263,42 @@ async fn banner(addr: SocketAddr) -> Option<String> {
         .ok()?;
     let text = String::from_utf8_lossy(&buf[..n]).trim().to_string();
     text.starts_with("SSH-").then_some(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PK: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGxx egdod-controller";
+
+    #[test]
+    fn line_carries_options_and_utc_expiry() {
+        let t = UNIX_EPOCH + Duration::from_secs(1_788_264_600);
+        assert_eq!(
+            authorized_line(r#"from="127.0.0.1,::1""#, t, PK),
+            format!(r#"from="127.0.0.1,::1",expiry-time=202609011210Z {PK}"#)
+        );
+    }
+
+    #[test]
+    fn civil_dates_match_the_calendar() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+        assert_eq!(civil_from_days(20_089), (2025, 1, 1));
+        let last_minute = UNIX_EPOCH + Duration::from_secs(951_782_400 + 86_399);
+        assert_eq!(utc_yyyymmddhhmm(last_minute), "200002292359Z");
+    }
+
+    #[test]
+    fn rerun_replaces_by_blob_and_keeps_strangers() {
+        let blob = key_blob(PK).unwrap();
+        let stale = format!("expiry-time=202601010000Z {PK}");
+        let other = "ssh-rsa AAAAB3other someone-else";
+        let fresh = format!("expiry-time=202701010000Z {PK}");
+        let once = merge_authorized_keys(&format!("{other}\n{stale}"), blob, &fresh);
+        assert_eq!(once, format!("{other}\n{fresh}\n"));
+        assert_eq!(merge_authorized_keys(&once, blob, &fresh), once);
+        assert_eq!(merge_authorized_keys("", blob, &fresh), format!("{fresh}\n"));
+        assert_eq!(merge_authorized_keys(other, blob, &fresh), format!("{other}\n{fresh}\n"));
+    }
 }

@@ -61,13 +61,20 @@ reap() { # kill everything this run started, and delete its scratch
 # is a backdoor, not a demo, so the guarantee cannot depend on this shell
 # surviving. The janitor is `setsid`-detached, so a group kill misses it; it
 # waits for this process to disappear and then reaps whatever is left.
-setsid bash -c '
-  while kill -0 '"$$"' 2>/dev/null; do sleep 1; done
+#
+# $DEMO reaches the janitor through the environment, never its argv: a janitor
+# whose argv contained the path was the first thing its own `pkill -f` killed,
+# and nothing after that line ever ran. The pid is paired with its start time
+# so a recycled pid cannot keep the janitor waiting on a stranger.
+proc_start() { cut -d')' -f2 "/proc/$1/stat" 2>/dev/null | awk '{print $20}'; }
+DEMO="$DEMO" WATCH_PID=$$ WATCH_START=$(proc_start $$) setsid bash -c '
+  same() { [ "$(cut -d")" -f2 "/proc/$WATCH_PID/stat" 2>/dev/null | awk "{print \$20}")" = "$WATCH_START" ]; }
+  while same; do sleep 1; done
   sleep 1
-  [ -f "'"$DEMO"'/sshd/sshd.pid" ] && kill "$(cat "'"$DEMO"'/sshd/sshd.pid")" 2>/dev/null
-  pkill -f "'"$DEMO"'" 2>/dev/null
-  sudo -n pkill -f "'"$DEMO"'" 2>/dev/null
-  rm -rf "'"$DEMO"'" 2>/dev/null || sudo -n rm -rf "'"$DEMO"'" 2>/dev/null
+  [ -f "$DEMO/sshd/sshd.pid" ] && kill "$(cat "$DEMO/sshd/sshd.pid")" 2>/dev/null
+  pkill -f "$DEMO" 2>/dev/null
+  sudo -n pkill -f "$DEMO" 2>/dev/null
+  rm -rf "$DEMO" 2>/dev/null || sudo -n rm -rf "$DEMO" 2>/dev/null
   exit 0
 ' >/dev/null 2>&1 </dev/null &
 disown 2>/dev/null || true
@@ -294,7 +301,9 @@ ctl exec "$AGENT" -- /bin/sh -c 'echo still-here'
 
 say "12. exec as root (only if this machine offers passwordless sudo)"
 if sudo -n true 2>/dev/null; then
-  sudo -n "$BIN" agent --controller "$NODE_ID" --key-file "$DEMO/root-agent.key" \
+  # A root agent outlives every kill of this unprivileged script (EPERM), so
+  # a kernel timer bounds it instead — `timeout` runs as root, on the inside.
+  sudo -n timeout 300 "$BIN" agent --controller "$NODE_ID" --key-file "$DEMO/root-agent.key" \
     --no-relay --direct "$DIRECT" >"$DEMO/root-agent.log" 2>&1 &
   PIDS+=($!)
   wait_for 30 "grep -q 'agent pubkey' '$DEMO/root-agent.log'"
@@ -304,7 +313,8 @@ if sudo -n true 2>/dev/null; then
   echo "uid seen by exec: $(ctl exec "$ROOT_AGENT" -- id -u)"
   # Reads a root-only file without printing any of it.
   ctl exec "$ROOT_AGENT" -- head -c 0 /etc/shadow && echo "/etc/shadow is readable: exec really is root"
-  sudo -n kill "$(pgrep -f "$BIN agent --controller $NODE_ID --key-file $DEMO/root-agent.key")" 2>/dev/null || true
+  # shellcheck disable=SC2046
+  sudo -n kill $(pgrep -f "$BIN agent --controller $NODE_ID --key-file $DEMO/root-agent.key") 2>/dev/null || true
 else
   echo "skipped: no passwordless sudo here"
 fi
