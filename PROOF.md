@@ -24,10 +24,13 @@ skipped. `EGDOD_DEMO_OFFLINE=1` skips 15-17 and prints what that costs.
 
 ## PROVED
 
-### `cargo test` — 16 tests, green
+### `cargo test` — 19 tests, green
 
 ```
-running 15 tests
+running 18 tests
+test ssh::tests::line_carries_options_and_utc_expiry ... ok
+test ssh::tests::civil_dates_match_the_calendar ... ok
+test ssh::tests::rerun_replaces_by_blob_and_keeps_strangers ... ok
 test net::tests::path_classification ... ok
 test net::tests::relay_addr_is_never_reported_as_direct ... ok
 test proto::tests::missing_and_unreadable_are_distinct_replies ... ok
@@ -44,7 +47,7 @@ test state::tests::key_is_stable_and_private ... ok
 test proto::tests::copy_verifies_digest_and_preserves_mode ... ok
 test net::tests::probe_of_a_nonexistent_endpoint_fails ... ok
 
-test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.03s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.03s
 
      Running tests/integration.rs
 running 1 test
@@ -182,7 +185,7 @@ starts sshd with `exec`, reaches it through `forward`, and writes `known_hosts`
 from a host key that crossed the already-authenticated egdod channel.
 
 ```
-egdod: installed an authorized key at .../target-authorized_keys
+egdod: installed at .../target-authorized_keys: from="127.0.0.1,::1",expiry-time="202609012000Z" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOuR9rCaf7hKATaMTgX3VKcISnXPN9yjjaB7DiN6WWd1 egdod-controller
 egdod: no host key on the target; generating one with ["ssh-keygen", "-q", "-t", "ed25519", ...]
 egdod: no sshd answering; starting it with [".../openssh-10.4p1/bin/sshd", "-f", ...]
 egdod: sshd is up: SSH-2.0-OpenSSH_10.4
@@ -194,6 +197,27 @@ bothouse
 `-o StrictHostKeyChecking=yes -o BatchMode=yes -o IdentitiesOnly=yes` with a
 private `UserKnownHostsFile`. It could not have prompted, and it could not have
 succeeded via the user's own keys or known_hosts.
+
+**The line the recipe leaves behind is harmless by construction.** Nothing in
+egdod removes it (the recipe has no teardown; on a real target it outlives the
+session), so the line itself is pinned: `from="127.0.0.1,::1"` means sshd
+accepts the key only from the target's own loopback — which is where the
+`forward` exits — and `expiry-time` (default 10 minutes, `--key-ttl-secs`)
+retires it by the target's clock. A rerun replaces the line by key blob rather
+than appending. Step 9b runs the recipe twice and then offers the same key from
+this host's LAN address; sshd refuses it (egdod#7):
+
+```
+target authorized_keys after two runs of the recipe:
+from="127.0.0.1,::1",expiry-time="202609012000Z" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOuR9rCaf7hKATaMTgX3VKcISnXPN9yjjaB7DiN6WWd1 egdod-controller
+from 192.168.1.141 with the same key: bot@127.0.0.1: Permission denied (publickey).
+```
+
+sshd's side of that refusal, from the journal:
+`Authentication tried for bot with correct key but not from a permitted host (host=192.168.1.141, ip=192.168.1.141, required=127.0.0.1,::1)`.
+The controls: the same connect without `from=` on the line succeeds, and a
+line whose `expiry-time` lies ten minutes in the past is refused with
+`entry expired`.
 
 ### The controller knows when nobody can dial it
 
@@ -291,16 +315,31 @@ AFTER:  a0370156d0e729127533fd7d30ac595a63787123e9f2b4f2cd48a77adc86429e
 script is normally run inside `nix-shell`; killing the wrapper leaves the script
 orphaned but running, and a `SIGKILL` on the script itself runs no trap at all
 — which would strand an sshd listening with a freshly installed key. There is
-now a `setsid`-detached janitor that waits for the script's pid to disappear and
-reaps whatever is left, so the guarantee does not depend on this shell
-surviving. Tested by `SIGKILL`ing the script mid-run, which no trap can catch:
+a `setsid`-detached janitor that waits for the script's pid (paired with its
+start time) to disappear and reaps whatever is left, so the guarantee does not
+depend on this shell surviving. Its first version killed itself: its own argv
+carried the scratch path, so its `pkill -f` matched the janitor before the
+`rm -rf` line ran, and the earlier transcript here — "procs 0, sshd 0", no
+"scratch removed" — was consistent with that without anyone noticing (egdod#7).
+The path now reaches it through the environment. The step-12 root agent runs
+under a root-side `timeout 300` as the backstop for the kill the janitor cannot
+survive either (a cgroup kill takes both). Tested by `SIGKILL`ing the script
+while the root agent is up, which no trap can catch:
 
 ```
-demo.sh pid=2907307 — SIGKILL (no trap can possibly run)
-waiting for the janitor...
-AFTER:  a0370156d0e729127533fd7d30ac595a63787123e9f2b4f2cd48a77adc86429e
-leftover procs:   0
-leftover sshd:    0
+demo.sh pid=2709593, in step 12, scratch /tmp/nix-shell-2709448-2653668780/egdod-demo.kvcVQ7
+root agent up (uid 0):
+2712513 .../sudo -n timeout 300 .../egdod agent --controller … --key-file /tmp/.../egdod-demo.kvcVQ7/root-agent.key --no-relay --direct 127.0.0.1:45777
+2712518 timeout 300 .../egdod agent --controller … --key-file /tmp/.../egdod-demo.kvcVQ7/root-agent.key --no-relay --direct 127.0.0.1:45777
+2712519 .../egdod agent --controller … --key-file /tmp/.../egdod-demo.kvcVQ7/root-agent.key --no-relay --direct 127.0.0.1:45777
+sshd on :2299 before: 1
+20:03:37Z SIGKILL sent to demo.sh (no trap can run)
+after 2 s:
+  scratch dir exists:   no
+  egdod agents left:    0
+  sshd on :2299:        0
+  procs naming scratch: 0
+  janitor left:         0
 ```
 
 ### No secret in the image
@@ -402,6 +441,10 @@ anything specified:
   are the real ones (`root`, `/root/.ssh/authorized_keys`, `sshd`,
   `127.0.0.1:22`) and the flags exist so the demo can point it at an
   unprivileged sshd instead.
+- `controller ssh --key-options/--key-ttl-secs` — the options and lifetime on
+  the installed authorized_keys line (defaults `from="127.0.0.1,::1"`, 600 s);
+  the spec does not describe that line, so this is an addition, not a change.
+  An off-target `--target-addr` needs `--key-options` changed to match.
 
 ## NOT PROVED
 
