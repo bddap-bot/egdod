@@ -279,6 +279,30 @@ ctl ssh "$AGENT" \
 echo "known_hosts the controller wrote:"
 cat "$STATE/ssh/known_hosts"
 
+say "9b. the installed key is loopback-only, expires, and a rerun renews rather than accretes"
+ctl ssh "$AGENT" --user "$(id -un)" --authorized-keys "$DEMO/target-authorized_keys" \
+  --host-key "$DEMO/sshd/ssh_host_ed25519_key.pub" --target-addr "127.0.0.1:$SSHD_PORT" \
+  -- true 2>/dev/null
+echo "target authorized_keys after two runs of the recipe:"
+cat "$DEMO/target-authorized_keys"
+[ "$(grep -c egdod-controller "$DEMO/target-authorized_keys")" = 1 ] \
+  || { echo "DEFECT: the recipe accreted a line per run" >&2; exit 1; }
+grep -q '^from="127.0.0.1,::1",expiry-time="[0-9]\{12\}Z" ' "$DEMO/target-authorized_keys" \
+  || { echo "DEFECT: the installed line is not loopback-pinned and expiring" >&2; exit 1; }
+# The same key from a non-loopback source address must be refused by sshd
+# itself; it is the one thing that makes a leftover line harmless.
+LAN=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -m1 -E '^[0-9]+\.' || true)
+if [ -n "$LAN" ]; then
+  if ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o IdentitiesOnly=yes \
+      -o UserKnownHostsFile=/dev/null -i "$STATE/ssh/id_ed25519" -b "$LAN" \
+      -p "$SSHD_PORT" "$(id -un)@127.0.0.1" true 2>"$DEMO/lan-ssh.err"; then
+    echo "DEFECT: the installed key worked from $LAN" >&2; exit 1
+  fi
+  echo "from $LAN with the same key: $(tail -1 "$DEMO/lan-ssh.err")"
+else
+  echo "no non-loopback address on this host; the from= refusal was not exercised"
+fi
+
 say "10. PRIMITIVE forward — a local port onto the target's sshd, proven by its banner"
 "$BIN" controller --state-dir "$STATE" forward "$AGENT" 0 "127.0.0.1:$SSHD_PORT" >"$DEMO/fwd.log" 2>&1 &
 PIDS+=($!)

@@ -127,7 +127,7 @@ fn key_blob(pubkey_line: &str) -> Option<&str> {
 }
 
 fn authorized_line(options: &str, expiry: SystemTime, pubkey_line: &str) -> String {
-    format!("{options},expiry-time={} {pubkey_line}", utc_yyyymmddhhmm(expiry))
+    format!("{options},expiry-time=\"{}\" {pubkey_line}", utc_yyyymmddhhmm(expiry))
 }
 
 /// The `Z` form: without it sshd judges the stamp in the target's local zone,
@@ -276,7 +276,7 @@ mod tests {
         let t = UNIX_EPOCH + Duration::from_secs(1_788_264_600);
         assert_eq!(
             authorized_line(r#"from="127.0.0.1,::1""#, t, PK),
-            format!(r#"from="127.0.0.1,::1",expiry-time=202609011210Z {PK}"#)
+            format!(r#"from="127.0.0.1,::1",expiry-time="202609011210Z" {PK}"#)
         );
     }
 
@@ -292,9 +292,9 @@ mod tests {
     #[test]
     fn rerun_replaces_by_blob_and_keeps_strangers() {
         let blob = key_blob(PK).unwrap();
-        let stale = format!("expiry-time=202601010000Z {PK}");
+        let stale = format!(r#"expiry-time="202601010000Z" {PK}"#);
         let other = "ssh-rsa AAAAB3other someone-else";
-        let fresh = format!("expiry-time=202701010000Z {PK}");
+        let fresh = format!(r#"expiry-time="202701010000Z" {PK}"#);
         let once = merge_authorized_keys(&format!("{other}\n{stale}"), blob, &fresh);
         assert_eq!(once, format!("{other}\n{fresh}\n"));
         assert_eq!(merge_authorized_keys(&once, blob, &fresh), once);
