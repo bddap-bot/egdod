@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static char cmdline[8192];
@@ -124,6 +125,49 @@ static char **agent_argv(void) {
     return av;
 }
 
+static char *word_at(const char *s, int idx) {
+    static char buf[256];
+    for (int i = 0; i < idx; i++) {
+        while (*s == ' ') s++;
+        while (*s && *s != ' ') s++;
+    }
+    while (*s == ' ') s++;
+    int n = 0;
+    while (s[n] && s[n] != ' ' && s[n] != '\n' && n < 255) { buf[n] = s[n]; n++; }
+    buf[n] = 0;
+    return buf;
+}
+
+static void switch_root(pid_t agent) {
+    char req[256] = {0};
+    int fd = open("/switch.req", O_RDONLY);
+    if (fd < 0) return;
+    read(fd, req, sizeof req - 1);
+    close(fd);
+    char newroot[256], initpath[256];
+    strncpy(newroot, word_at(req, 0), sizeof newroot - 1);
+    strncpy(initpath, word_at(req, 1), sizeof initpath - 1);
+    if (!newroot[0]) strcpy(newroot, "/newroot");
+    if (!initpath[0]) strcpy(initpath, "/sbin/init");
+    char probe[512];
+    snprintf(probe, sizeof probe, "%s%s", newroot, initpath);
+    if (access(probe, X_OK)) {
+        printf("init: switch_root refused, %s not executable errno=%d\n", probe, errno);
+        unlink("/switch.req");
+        return;
+    }
+    printf("init: switch_root into %s exec %s\n", newroot, initpath);
+    fflush(stdout);
+    if (agent > 0) { kill(agent, SIGKILL); int s; waitpid(agent, &s, 0); }
+    if (chdir(newroot)) { printf("init: switch_root chdir errno=%d\n", errno); return; }
+    if (mount(".", "/", NULL, MS_MOVE, NULL)) { printf("init: switch_root MS_MOVE errno=%d\n", errno); return; }
+    if (chroot(".")) { printf("init: switch_root chroot errno=%d\n", errno); return; }
+    chdir("/");
+    char *av[] = { initpath, NULL };
+    execv(initpath, av);
+    printf("init: switch_root exec %s failed errno=%d\n", initpath, errno);
+}
+
 int main(void) {
     mkdir("/proc", 0755);
     mkdir("/sys", 0755);
@@ -166,21 +210,28 @@ int main(void) {
     fflush(stdout);
 
     char **av = agent_argv();
+    pid_t agent = fork();
+    if (agent == 0) {
+        execv(av[0], av);
+        printf("init: exec %s failed errno=%d\n", av[0], errno);
+        _exit(127);
+    }
     for (;;) {
-        pid_t pid = fork();
-        if (pid == 0) {
-            execv(av[0], av);
-            printf("init: exec %s failed errno=%d\n", av[0], errno);
-            _exit(127);
+        int st;
+        pid_t w;
+        while ((w = waitpid(-1, &st, WNOHANG)) > 0) {
+            if (w == agent) {
+                printf("init: agent exited; relaunching\n");
+                fflush(stdout);
+                agent = fork();
+                if (agent == 0) {
+                    execv(av[0], av);
+                    _exit(127);
+                }
+            }
         }
-        int status;
-        for (;;) {
-            pid_t w = wait(&status);
-            if (w == pid) break;
-            if (w < 0 && errno == ECHILD) break;
-        }
-        printf("init: agent exited; relaunching\n");
-        fflush(stdout);
-        sleep(2);
+        if (access("/switch.req", F_OK) == 0) switch_root(agent);
+        struct timespec ts = { 1, 0 };
+        nanosleep(&ts, NULL);
     }
 }
