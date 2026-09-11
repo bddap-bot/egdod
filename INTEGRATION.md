@@ -101,7 +101,7 @@ ask for revocation and it was left alone rather than half-built.
 
 `SPEC.md` puts image building out of scope for v0, so v0 is the protocol proven
 on a machine that already booted. The boot itself is now built and watched, in
-`boot/` and in `PROOF.md`. The pieces that account said were missing are there:
+`boot/` and in `PROOF.md`. The pieces the earlier account listed as missing are there:
 a kernel and an initramfs with the agent as `init`; the static binary that
 survives a datagram; the NIC driver and both ways to bring the link up, static
 and DHCP; and a stick image, produced by a nix derivation from a distro-signed

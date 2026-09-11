@@ -14,11 +14,9 @@ trap cleanup EXIT
 
 say() { printf '\n=== %s\n' "$*"; }
 
-NIXPKGS='(import (builtins.fetchTarball { url = "https://github.com/NixOS/nixpkgs/archive/e2587caef70cea85dd97d7daab492899902dbf5d.tar.gz"; sha256 = "14jrgz4z2m8n1c8qwcla44kdy9kd7x0xnwfyrajnyvnhkxbnnqf1"; }) {})'
-
 say "building qemu + OVMF (Microsoft keys) and the native controller"
-QEMU=$(nix-build --no-out-link -E "$NIXPKGS.qemu")/bin/qemu-system-x86_64
-OVMF=$(nix-build --no-out-link -E "$NIXPKGS.OVMFFull.fd")/FV
+QEMU=$(nix-build --no-out-link nixpkgs.nix -A qemu)/bin/qemu-system-x86_64
+OVMF=$(nix-build --no-out-link nixpkgs.nix -A OVMFFull.fd)/FV
 CODE=$OVMF/OVMF_CODE.ms.fd
 VARS_SRC=$OVMF/OVMF_VARS.ms.fd
 [ -r "$CODE" ] && [ -r "$VARS_SRC" ] || { echo "OVMF Microsoft-key firmware not found" >&2; exit 1; }
@@ -70,6 +68,13 @@ done
 echo "agent pubkey seen on serial: $AGENT"
 
 say "before approval: the controller serves the agent nothing"
+for _ in $(seq 1 30); do
+  "$BIN" controller --state-dir "$STATE" pending --json 2>/dev/null | grep -q "$AGENT" && break
+  sleep 2
+done
+"$BIN" controller --state-dir "$STATE" pending --json 2>/dev/null | grep -q "$AGENT" \
+  || { echo "DEFECT: agent connected but never appeared as pending" >&2; exit 1; }
+echo "agent is connected and held pending"
 if "$BIN" controller --state-dir "$STATE" exec "$AGENT" -- /bin/busybox true >/dev/null 2>&1; then
   echo "DEFECT: an unapproved agent was served" >&2; exit 1
 fi
@@ -88,12 +93,15 @@ echo "--- uname -a over the wire:"
 "$BIN" controller --state-dir "$STATE" exec "$AGENT" -- /bin/busybox uname -a
 echo "--- /proc/cmdline read from the booted VM (proves the baked node id):"
 "$BIN" controller --state-dir "$STATE" exec "$AGENT" -- /bin/busybox cat /proc/cmdline
-echo "--- SecureBoot EFI variable, read from inside the guest firmware (01 = on):"
-echo "(attributes then value; trailing 01 = Secure Boot on)"
-"$BIN" controller --state-dir "$STATE" exec "$AGENT" -- /bin/busybox od -An -tx1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c || true
+echo "--- SecureBoot EFI variable, read from inside the guest firmware (attributes then value; 01 = on):"
+"$BIN" controller --state-dir "$STATE" exec "$AGENT" -- /bin/busybox od -An -tx1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c >"$WORK/sb" 2>/dev/null || true
+cat "$WORK/sb"
+SBVAL=$(tr -d ' \n' < "$WORK/sb" | tail -c2)
+[ "$SBVAL" = 01 ] || { echo "DEFECT: SecureBoot value is '$SBVAL', not 01 — Secure Boot not enforcing" >&2; exit 1; }
+echo "SecureBoot value byte is 01: firmware reports Secure Boot on"
 
 say "receive a root filesystem over the wire and switch_root into it"
-STATIC_CC=$(nix-build --no-out-link -E "$NIXPKGS.pkgsStatic.stdenv.cc")/bin/x86_64-unknown-linux-musl-gcc
+STATIC_CC=$(nix-build --no-out-link nixpkgs.nix -A pkgsStatic.stdenv.cc)/bin/x86_64-unknown-linux-musl-gcc
 cat > "$WORK/newinit.c" <<'C'
 #include <fcntl.h>
 #include <stdio.h>

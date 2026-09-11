@@ -110,13 +110,13 @@ static void dhcp(const char *dev) {
 
 static void network(void) {
     if (flag("egdod.dhcp")) {
-        char *dev = arg("egdod.dev") ? dup_word(arg("egdod.dev")) : strdup("eth0");
+        char *dev = "eth0";
         dhcp(dev);
         return;
     }
     const char *ip = arg("egdod.ip");
     if (!ip) return;
-    char *dev = arg("egdod.dev") ? dup_word(arg("egdod.dev")) : strdup("eth0");
+    char *dev = "eth0";
     char *ipw = dup_word(ip);
     char *mask = arg("egdod.mask") ? dup_word(arg("egdod.mask")) : strdup("255.255.255.0");
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -161,12 +161,23 @@ static char *word_at(const char *s, int idx) {
     return buf;
 }
 
-static void switch_root(pid_t agent) {
+static pid_t spawn_agent(char **av) {
+    pid_t p = fork();
+    if (p == 0) {
+        execv(av[0], av);
+        printf("init: exec %s failed errno=%d\n", av[0], errno);
+        _exit(127);
+    }
+    return p;
+}
+
+static void switch_root(pid_t *agent, char **av) {
     char req[256] = {0};
     int fd = open("/switch.req", O_RDONLY);
     if (fd < 0) return;
     read(fd, req, sizeof req - 1);
     close(fd);
+    unlink("/switch.req");
     char newroot[256], initpath[256];
     strncpy(newroot, word_at(req, 0), sizeof newroot - 1);
     strncpy(initpath, word_at(req, 1), sizeof initpath - 1);
@@ -176,19 +187,21 @@ static void switch_root(pid_t agent) {
     snprintf(probe, sizeof probe, "%s%s", newroot, initpath);
     if (access(probe, X_OK)) {
         printf("init: switch_root refused, %s not executable errno=%d\n", probe, errno);
-        unlink("/switch.req");
         return;
     }
     printf("init: switch_root into %s exec %s\n", newroot, initpath);
     fflush(stdout);
-    if (agent > 0) { kill(agent, SIGKILL); int s; waitpid(agent, &s, 0); }
-    if (chdir(newroot)) { printf("init: switch_root chdir errno=%d\n", errno); return; }
-    if (mount(".", "/", NULL, MS_MOVE, NULL)) { printf("init: switch_root MS_MOVE errno=%d\n", errno); return; }
-    if (chroot(".")) { printf("init: switch_root chroot errno=%d\n", errno); return; }
+    if (*agent > 0) { kill(*agent, SIGKILL); int s; waitpid(*agent, &s, 0); *agent = -1; }
+    if (chdir(newroot) || mount(".", "/", NULL, MS_MOVE, NULL) || chroot(".")) {
+        printf("init: switch_root failed errno=%d; relaunching agent\n", errno);
+        *agent = spawn_agent(av);
+        return;
+    }
     chdir("/");
-    char *av[] = { initpath, NULL };
-    execv(initpath, av);
+    char *nav[] = { initpath, NULL };
+    execv(initpath, nav);
     printf("init: switch_root exec %s failed errno=%d\n", initpath, errno);
+    for (;;) pause();
 }
 
 int main(void) {
@@ -207,7 +220,7 @@ int main(void) {
     }
 
     const char *mods = arg("egdod.mods");
-    char *ml = mods ? dup_word(mods) : strdup("/e1000.ko");
+    char *ml = mods ? dup_word(mods) : strdup("/e1000.ko,/efivarfs.ko");
     for (char *tok = strtok(ml, ","); tok; tok = strtok(NULL, ",")) load_module(tok);
 
     mkdir("/sys/firmware", 0755);
@@ -233,12 +246,7 @@ int main(void) {
     fflush(stdout);
 
     char **av = agent_argv();
-    pid_t agent = fork();
-    if (agent == 0) {
-        execv(av[0], av);
-        printf("init: exec %s failed errno=%d\n", av[0], errno);
-        _exit(127);
-    }
+    pid_t agent = spawn_agent(av);
     for (;;) {
         int st;
         pid_t w;
@@ -246,14 +254,10 @@ int main(void) {
             if (w == agent) {
                 printf("init: agent exited; relaunching\n");
                 fflush(stdout);
-                agent = fork();
-                if (agent == 0) {
-                    execv(av[0], av);
-                    _exit(127);
-                }
+                agent = spawn_agent(av);
             }
         }
-        if (access("/switch.req", F_OK) == 0) switch_root(agent);
+        if (access("/switch.req", F_OK) == 0) switch_root(&agent, av);
         struct timespec ts = { 1, 0 };
         nanosleep(&ts, NULL);
     }
