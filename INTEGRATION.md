@@ -115,3 +115,11 @@ What is left is not in this repo's control: a boot on a physical Secure-Boot
 machine, whose firmware is not OVMF, and a session across two genuinely separate
 networks. The stick is written for that test; until it runs, "boots under Secure
 Boot" means "boots under OVMF with Microsoft keys".
+
+## A controller that is always serving
+
+The written image names exactly one node id, so a persistent controller serves
+it: `egdod controller serve` over the key the image was built against, kept
+running by the host it lives on. Keys that land in `pending` are surfaced for
+approval by that host, not by this repo. `default.nix` builds the host binary
+that serves; `musl.nix` is the same derivation built statically for the target.

@@ -85,6 +85,7 @@
     {
       "paths": [
         "vendor/**",
+        "default.nix",
         "musl.nix",
         "Cargo.toml",
         "Cargo.lock"
@@ -92,9 +93,10 @@
       "tests": [
         "nix-shell --run 'cargo test --manifest-path vendor/noq-udp/Cargo.toml --lib'",
         "nix-shell --run 'cargo test'",
-        "nix-build musl.nix -o result-gate"
+        "nix-build musl.nix -o result-gate",
+        "nix-build default.nix -o result-host-gate"
       ],
-      "why": "the vendored noq-udp patch, the [patch.crates-io] wiring and the lockfile exist for the static musl agent (SPEC property 4, egdod#3) — so besides both native suites, the cross build itself must still produce a binary; nix caches it by input hash"
+      "why": "the vendored noq-udp patch, the [patch.crates-io] wiring and the lockfile exist for the static musl agent (SPEC property 4, egdod#3) — so besides both native suites, the host build and the cross build must still produce a binary; nix caches them by input hash"
     },
     {
       "paths": [
