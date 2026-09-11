@@ -39,8 +39,10 @@ PIDS+=($!)
 sleep 2
 
 say "building the stick image for this controller (Secure Boot chain, pinned)"
+NET_ARGS=()
+if [ "${EGDOD_BOOT_DHCP:-}" = 1 ]; then NET_ARGS=(--arg dhcp true); echo "network: DHCP"; else echo "network: static"; fi
 IMG=$(nix-build --no-out-link boot/image.nix \
-  --argstr controllerNodeId "$NODE_ID" --argstr direct "$DIRECT")/esp.img
+  --argstr controllerNodeId "$NODE_ID" --argstr direct "$DIRECT" "${NET_ARGS[@]}")/esp.img
 echo "image: $IMG"
 
 cp "$VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"

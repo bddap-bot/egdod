@@ -2,6 +2,7 @@
 , direct ? ""
 , relay ? ""
 , noRelay ? true
+, dhcp ? false
 , ip ? "10.0.2.15"
 , gw ? "10.0.2.2"
 , mask ? "255.255.255.0"
@@ -34,8 +35,10 @@ let
   relayArg = pkgs.lib.optionalString (relay != "") " egdod.relay=${relay}";
   directArg = pkgs.lib.optionalString (direct != "") " egdod.direct=${direct}";
   noRelayArg = pkgs.lib.optionalString noRelay " egdod.norelay";
+  netArg = if dhcp then " egdod.dhcp"
+           else " egdod.ip=${ip} egdod.gw=${gw} egdod.mask=${mask}";
   cmdline = "console=ttyS0,115200 egdod.controller=${controllerNodeId}"
-    + " egdod.ip=${ip} egdod.gw=${gw} egdod.mask=${mask} egdod.mods=/e1000.ko,/efivarfs.ko"
+    + netArg + " egdod.mods=/e1000.ko,/efivarfs.ko"
     + relayArg + directArg + noRelayArg;
 in
 pkgs.stdenv.mkDerivation {
@@ -62,6 +65,8 @@ pkgs.stdenv.mkDerivation {
     cp ${agent}/bin/egdod rootfs/egdod
     mkdir -p rootfs/bin
     cp ${pkgs.pkgsStatic.busybox}/bin/busybox rootfs/bin/busybox
+    cp ${./udhcpc.script} rootfs/bin/udhcpc.script
+    chmod +x rootfs/bin/udhcpc.script
     xz -dc "$MODS/drivers/net/ethernet/intel/e1000/e1000.ko.xz" > rootfs/e1000.ko
     xz -dc "$MODS/fs/efivarfs/efivarfs.ko.xz" > rootfs/efivarfs.ko
     ( cd rootfs && find . -print0 | cpio --null -H newc -o 2>/dev/null | gzip -9 ) > initrd.img
