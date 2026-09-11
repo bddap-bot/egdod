@@ -109,7 +109,7 @@ async fn end_to_end() {
         controller::push(&state, &agent_pk, &key_file, "/tmp/should-not-land")
             .await
             .err(),
-        controller::pull(&state, &agent_pk, "/etc/hostname", &dir.path().join("nope"))
+        controller::pull(&state, &agent_pk, "/etc/hostname", &dir.path().join("nope"), u64::MAX)
             .await
             .err(),
     ] {
@@ -198,7 +198,7 @@ async fn end_to_end() {
     assert_eq!(mode_of(&on_target), 0o751, "mode survived the push");
 
     let down = dir.path().join("down.bin");
-    controller::pull(&state, &agent_pk, on_target_s, &down)
+    controller::pull(&state, &agent_pk, on_target_s, &down, u64::MAX)
         .await
         .unwrap();
     assert_eq!(
@@ -208,10 +208,25 @@ async fn end_to_end() {
     );
     assert_eq!(mode_of(&down), 0o751, "mode survived the pull");
 
+    // The same file, over a real link, under a ceiling it does not fit: refused
+    // on the declaration, before a byte of it is staged.
+    let capped = dir.path().join("capped.bin");
+    let e = controller::pull(&state, &agent_pk, on_target_s, &capped, 1 << 20)
+        .await
+        .expect_err("a pull over --max-bytes must fail");
+    assert!(format!("{e:#}").contains("ceiling"), "{e:#}");
+    assert!(!capped.exists());
+    assert!(
+        !std::fs::read_dir(dir.path())
+            .unwrap()
+            .any(|e| e.unwrap().file_name().to_string_lossy().contains("egdod-part")),
+        "a staging file was created for a refused pull"
+    );
+
     // Pulling something that is not there is distinct from pulling something
     // that failed, and leaves no file behind either way.
     let missing = dir.path().join("missing.bin");
-    let e = controller::pull(&state, &agent_pk, "/no/such/file", &missing)
+    let e = controller::pull(&state, &agent_pk, "/no/such/file", &missing, u64::MAX)
         .await
         .expect_err("pulling a missing path must fail");
     assert!(
@@ -232,7 +247,7 @@ async fn end_to_end() {
     })
     .unwrap();
     let dest = dir.path().join("stolen.bin");
-    let e = controller::pull(&state, &agent_pk, unreadable.to_str().unwrap(), &dest)
+    let e = controller::pull(&state, &agent_pk, unreadable.to_str().unwrap(), &dest, u64::MAX)
         .await
         .expect_err("an unreadable file must not pull successfully");
     let msg = format!("{e:#}");
