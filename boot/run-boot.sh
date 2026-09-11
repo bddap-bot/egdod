@@ -90,11 +90,53 @@ echo "--- SecureBoot EFI variable, read from inside the guest firmware (01 = on)
 echo "(attributes then value; trailing 01 = Secure Boot on)"
 "$BIN" controller --state-dir "$STATE" exec "$AGENT" -- /bin/busybox od -An -tx1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c || true
 
+say "receive a root filesystem over the wire and switch_root into it"
+STATIC_CC=$(nix-build --no-out-link -E "$NIXPKGS.pkgsStatic.stdenv.cc")/bin/x86_64-unknown-linux-musl-gcc
+cat > "$WORK/newinit.c" <<'C'
+#include <fcntl.h>
+#include <stdio.h>
+#include <sys/stat.h>
+#include <sys/mount.h>
+#include <unistd.h>
+int main(void) {
+    printf("NEWROOT-INIT: switch_root landed; the received OS is PID 1 now\n");
+    char b[256];
+    int fd = open("/os-marker", O_RDONLY);
+    if (fd >= 0) { int n = read(fd, b, sizeof b - 1); if (n > 0) { b[n] = 0; printf("NEWROOT-INIT: %s", b); } close(fd); }
+    mkdir("/proc", 0755);
+    mount("proc", "/proc", "proc", 0, NULL);
+    fd = open("/proc/version", O_RDONLY);
+    if (fd >= 0) { int n = read(fd, b, sizeof b - 1); if (n > 0) { b[n] = 0; printf("NEWROOT-INIT: same kernel, no kexec: %s", b); } close(fd); }
+    fflush(stdout);
+    for (;;) pause();
+}
+C
+"$STATIC_CC" -static -O2 -o "$WORK/newinit" "$WORK/newinit.c"
+mkdir -p "$WORK/nr/sbin"
+cp "$WORK/newinit" "$WORK/nr/sbin/init"
+echo "received over egdod, unpacked into a tmpfs, no distro touched it" > "$WORK/nr/os-marker"
+( cd "$WORK/nr" && tar cf "$WORK/newroot.tar" . )
+echo "pushing the rootfs tarball to the target as root"
+"$BIN" controller --state-dir "$STATE" push "$AGENT" "$WORK/newroot.tar" /newroot.tar
+echo "unpacking into a fresh tmpfs and arming the handoff"
+"$BIN" controller --state-dir "$STATE" exec "$AGENT" -- /bin/busybox sh -c \
+  'mkdir -p /newroot && /bin/busybox mount -t tmpfs none /newroot && cd /newroot && /bin/busybox tar xf /newroot.tar && printf "%s" "/newroot /sbin/init" > /switch.req' || true
+echo "waiting for the received OS to come up as PID 1 on the serial console"
+SR=""
+for _ in $(seq 1 30); do
+  SR=$(grep -a "NEWROOT-INIT: switch_root landed" "$SERIAL" 2>/dev/null | head -1 || true)
+  [ -n "$SR" ] && break
+  sleep 2
+done
+[ -n "$SR" ] || { echo "DEFECT: switch_root marker never appeared on serial" >&2; sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$SERIAL" | tail -20 >&2; exit 1; }
+echo "switch_root confirmed on serial:"
+sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$SERIAL" | grep -a "NEWROOT-INIT" | head -4
+
 say "controller serve log (path label, agent connect):"
 grep -aE 'routed a session|agent connected|reachability|UNDIALABLE' "$WORK/serve.log" | tail -8 || true
 
 say "Secure Boot markers from the guest kernel (serial console):"
-sed 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\x1b[=>]//g' "$SERIAL" | grep -aE "Secure Boot is enabled|locked down from EFI|secureboot: Secure boot|Debian Secure Boot CA|e1000 .* eth0|init: egdod|agent pubkey" | head -12
+sed 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\x1b[=>]//g' "$SERIAL" | grep -aE "Secure Boot is enabled|locked down from EFI|secureboot: Secure boot|Debian Secure Boot CA|e1000 .* eth0|init: egdod|agent pubkey|switch_root|NEWROOT-INIT" | head -12
 
 if [ -n "${BOTQ_ARTIFACTS_DIR:-}" ]; then
   sed 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\x1b[=>]//g' "$SERIAL" > "$BOTQ_ARTIFACTS_DIR/boot-serial.log"
