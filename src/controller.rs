@@ -9,8 +9,8 @@
 use crate::net::{self, Lookup, ProbeMode, RelayChoice};
 use crate::pipe::splice;
 use crate::proto::{
-    finish, hex, read_msg, read_msg_opt, recv_file_body, send_file_body, set_mode, stat_and_hash,
-    write_msg, Ack, ExecFrame, PullStart, Request, Route, RouteReply, ALPN, CLOSE_PENDING,
+    finish, hex, read_msg, read_msg_opt, recv_file_body, send_file_body, stat_and_hash, write_msg,
+    Ack, ExecFrame, PullStart, Request, Route, RouteReply, ALPN, CLOSE_PENDING,
     PROBE_ALPN, PROBE_PING, PROBE_PONG,
 };
 use crate::state::{now_unix, SessionInfo, StateDir, Status};
@@ -568,11 +568,17 @@ pub enum Pulled {
     Missing,
 }
 
+/// Default ceiling for `pull`: fits anything a target is plausibly asked for
+/// (logs, configs, keys, a kernel, an initramfs) and still fails fast on a
+/// handset; a disk image is a deliberate act and says so with `--max-bytes`.
+pub const DEFAULT_MAX_BYTES: u64 = 256 << 20;
+
 pub async fn pull_file(
     state: &StateDir,
     agent: &str,
     remote: &str,
     local: &Path,
+    max: u64,
 ) -> Result<Pulled> {
     let mut r = route(state, agent).await?;
     write_msg(
@@ -587,14 +593,20 @@ pub async fn pull_file(
         PullStart::Missing => Ok(Pulled::Missing),
         PullStart::Err(e) => bail!("agent could not read {remote}: {e}"),
         PullStart::Ok { mode, len, sha256 } => {
-            recv_file_body(&mut r.read, local, len, sha256, mode).await?;
+            recv_file_body(&mut r.read, local, len, sha256, mode, max).await?;
             Ok(Pulled::Fetched { len, sha256 })
         }
     }
 }
 
-pub async fn pull(state: &StateDir, agent: &str, remote: &str, local: &Path) -> Result<()> {
-    match pull_file(state, agent, remote, local).await? {
+pub async fn pull(
+    state: &StateDir,
+    agent: &str,
+    remote: &str,
+    local: &Path,
+    max: u64,
+) -> Result<()> {
+    match pull_file(state, agent, remote, local, max).await? {
         Pulled::Missing => bail!("the target has no {remote}"),
         Pulled::Fetched { len, sha256 } => {
             println!(
@@ -784,37 +796,4 @@ pub async fn exec_capture(
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = exec_into(state, agent, argv, &mut out, &mut err).await?;
     Ok((code, out, err))
-}
-
-/// Pulls a small file into memory, staging it through `scratch` because the copy
-/// primitive verifies the digest against a written file rather than a buffer.
-///
-/// `Ok(None)` means the target does not have the file, and nothing else: a
-/// transport failure is an error, because the ssh recipe rewrites what it reads.
-pub async fn pull_bytes(
-    state: &StateDir,
-    agent: &str,
-    remote: &str,
-    scratch: &Path,
-) -> Result<Option<Vec<u8>>> {
-    match pull_file(state, agent, remote, scratch).await? {
-        Pulled::Missing => Ok(None),
-        Pulled::Fetched { .. } => Ok(Some(tokio::fs::read(scratch).await?)),
-    }
-}
-
-/// Pushes bytes produced locally rather than read from a file, staging them
-/// through `scratch` so this is the same copy primitive and not a second one.
-pub async fn push_bytes(
-    state: &StateDir,
-    agent: &str,
-    remote: &str,
-    body: &[u8],
-    mode: u32,
-    scratch: &Path,
-) -> Result<()> {
-    tokio::fs::write(scratch, body).await?;
-    set_mode(scratch, mode).await?;
-    push_file(state, agent, scratch, remote).await?;
-    Ok(())
 }

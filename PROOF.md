@@ -24,49 +24,52 @@ skipped. `EGDOD_DEMO_OFFLINE=1` skips 15-17 and prints what that costs.
 
 ## PROVED
 
-### `cargo test` — 19 tests, green
+### `cargo test` — 21 tests, green
 
 ```
-running 18 tests
-test ssh::tests::line_carries_options_and_utc_expiry ... ok
-test ssh::tests::civil_dates_match_the_calendar ... ok
-test ssh::tests::rerun_replaces_by_blob_and_keeps_strangers ... ok
-test net::tests::path_classification ... ok
+running 20 tests
 test net::tests::relay_addr_is_never_reported_as_direct ... ok
-test proto::tests::missing_and_unreadable_are_distinct_replies ... ok
+test net::tests::path_classification ... ok
 test net::tests::relay_choice_flags ... ok
 test pipe::tests::splices_both_directions_and_propagates_eof ... ok
+test proto::tests::missing_and_unreadable_are_distinct_replies ... ok
+test proto::tests::declared_over_the_ceiling_is_refused_unwritten ... ok
 test proto::tests::msg_roundtrip_and_framing ... ok
-test state::tests::approved_list_tolerates_comments_and_junk ... ok
+test proto::tests::free_space_is_checked_before_anything_is_created ... ok
+test proto::tests::lying_stream_is_cut_at_the_announced_length ... ok
 test agent::tests::agent_key_is_stable_across_runs ... ok
+test ssh::tests::civil_dates_match_the_calendar ... ok
+test ssh::tests::line_carries_options_and_utc_expiry ... ok
+test ssh::tests::rerun_replaces_by_blob_and_keeps_strangers ... ok
+test state::tests::approved_list_tolerates_comments_and_junk ... ok
 test proto::tests::truncated_transfer_is_rejected ... ok
-test state::tests::approval_is_by_pubkey_and_survives_restart ... ok
-test proto::tests::overlong_transfer_is_cut_off ... ok
 test proto::tests::corrupt_transfer_leaves_no_destination ... ok
 test state::tests::key_is_stable_and_private ... ok
+test state::tests::approval_is_by_pubkey_and_survives_restart ... ok
 test proto::tests::copy_verifies_digest_and_preserves_mode ... ok
 test net::tests::probe_of_a_nonexistent_endpoint_fails ... ok
 
-test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.03s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.04s
 
      Running tests/integration.rs
 running 1 test
 test controller_and_agent_over_iroh ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.49s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.63s
 ```
 
 `cargo clippy --all-targets` emits nothing but its own progress:
 
 ```
-    Checking egdod v0.1.0 (/home/bot/.cache/botq-wt/1703)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.47s
+    Checking egdod v0.1.0 (/home/bot/.cache/botq-wt/3645)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.29s
 ```
 
 The integration test is a real iroh
 connection, not a mock: a controller serving, an agent dialling it by node id,
 the gate refusing exec, push, pull *and* a connection through a forward to a
-live listener before approval and serving them after, a 5 MiB round trip, a
+live listener before approval and serving them after, a 5 MiB round trip, the
+same file refused under a 1 MiB `--max-bytes` with nothing staged, a
 missing pull reported as missing and an unreadable one deliberately not, bytes
 through a forwarded port, and the session's own report of its path.
 
@@ -175,6 +178,43 @@ uid seen by exec: 0
 
 The second line is `head -c 0 /etc/shadow` succeeding — the file was opened, not
 read, which is enough to show the privilege without putting a hash in a log.
+
+### A lying target cannot fill the controller
+
+`pull` takes both the length and the digest from the target, and an approved
+target is untrusted hardware, so the receiver carries its own ceiling.
+`recv_file_body` — the one implementation behind `push` on the target and
+`pull` on the controller — refuses a declaration over the ceiling before any
+directory, staging file or byte exists; checks the staging filesystem's free
+space (`statvfs` on the destination's directory) before the first read; and
+cuts a stream that outruns its declared length, unlinking the staging file.
+`pull --max-bytes` defaults to 256 MiB. The ssh recipe pulls `authorized_keys`
+and the host key under a fixed 1 MiB and no longer reads either whole: the
+merge streams line by line into the file it pushes back, and the host key is
+read as one line.
+
+Watched, in the `cargo test` run above:
+
+- `declared_over_the_ceiling_is_refused_unwritten` — a 5-byte declaration
+  under a 4-byte ceiling, with a body whose digest matches: refused, the
+  directory stays empty, and the body is still unread on the stream
+  afterwards. Remove the ceiling check and the transfer succeeds.
+- `free_space_is_checked_before_anything_is_created` — a 2^60-byte
+  declaration into a directory made unwritable: refused with the free-space
+  message, nothing created, stream unread. Create the staging file before the
+  check instead and the error becomes a permission failure.
+- `lying_stream_is_cut_at_the_announced_length` — 4 bytes declared, a
+  megabyte streamed: the sender gets through at most four 4 KiB writes before
+  the receiver stops reading; no destination, no staging file.
+- `copy_verifies_digest_and_preserves_mode` — a 200,000-byte transfer with the
+  ceiling set exactly to its length still verifies its digest and mode.
+- `tests/integration.rs` — the 5 MiB round-trip file pulled again over the
+  real iroh session under a 1 MiB ceiling: refused on the declaration, no
+  destination, no staging file in the directory.
+
+Each test was falsified against its own mutation in a scratch checkout, named
+in the landing commit: removing the guarded line turns the test red for the
+stated reason, restoring it turns it green.
 
 ### The ssh recipe: first connect, no trust on first use
 
@@ -470,11 +510,6 @@ anything specified:
   documented answer and its URL parsing is unit tested, but no connection has
   been made that way. The no-DNS phase that *was* run used `--no-relay
   --direct`, which avoids the question rather than answering it.
-- **A hostile agent.** An approved agent declares both the length and the digest
-  of a file on `pull`, so an oversized transfer does not merely get written
-  before a check fails — it succeeds. No cap, no free-space check, and on the
-  ssh path the staged file is then read whole into controller memory. Approved
-  targets are untrusted hardware by design, so this is a real hole.
 - **Many agents.** One or two at a time. The pending list's 256-entry bound has
   never been reached.
 - **Revocation.** Removing a key from `approved` does not end a live session,
@@ -493,6 +528,14 @@ next round of proving.
   proves the *reaction* — detection, the loud log, the rebuild. It does not
   prove the rebuild restores dialability, because the failure was forced with a
   zero deadline rather than by an unreachable network.
+- **The free-space check on a filesystem that keeps no block accounting.**
+  `statvfs` reports zero blocks on ramfs and on a plain initramfs, so the check
+  returns early there rather than refusing every transfer; reasoned from the
+  kernel's `simple_statfs`, not observed — no test here mounts a ramfs. The
+  choice of `f_bfree` over `f_bavail` is reasoning too: on the target the
+  writer is root and the reserve is its to use; on the controller it
+  over-admits by that reserve and leaves the refusing to ENOSPC mid-stream,
+  which already unlinks the staging file.
 - **An initramfs agent needs approving once per boot.** The agent's key lives at
   `--key-file`; on a tmpfs that is gone at reboot, so a new key is generated and
   the target arrives pending again. Nothing secret is lost — the cost is a

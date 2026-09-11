@@ -6,13 +6,17 @@
 //! agent key the operator approved — ssh can be run with
 //! `StrictHostKeyChecking=yes -o BatchMode=yes`: no prompt, no trust-on-first-use.
 
-use crate::controller;
+use crate::controller::{self, Pulled};
 use crate::state::StateDir;
 use anyhow::{bail, Context, Result};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+
+/// Ceiling on what the recipe pulls from the target: an `authorized_keys` and
+/// a host key are a few lines each, so anything larger is not that file.
+const KEY_FILE_MAX_BYTES: u64 = 1 << 20;
 
 pub struct Config {
     pub agent: String,
@@ -38,26 +42,36 @@ pub struct Config {
 }
 
 pub async fn run(state: &StateDir, cfg: Config) -> Result<i32> {
+    // Per-process, so two concurrent `ssh` runs against one state dir cannot
+    // stage over each other; a leftover from a killed run with this pid goes first.
+    let scratch = state.ssh_dir().join(format!("scratch.{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch)
+        .with_context(|| format!("creating {}", scratch.display()))?;
+    let outcome = session(state, &cfg, &scratch).await;
+    // It holds what the target handed back, so it goes on every exit, not only
+    // the successful one.
+    let _ = std::fs::remove_dir_all(&scratch);
+    outcome
+}
+
+async fn session(state: &StateDir, cfg: &Config, scratch: &Path) -> Result<i32> {
     let (key, pubkey, known_hosts) = (
         state.ssh_key_path(),
         state.ssh_pub_path(),
         state.known_hosts_path(),
     );
-    std::fs::create_dir_all(state.ssh_dir())?;
     ensure_local_key(&key)?;
     let pubkey_line = std::fs::read_to_string(&pubkey)
         .with_context(|| format!("reading {}", pubkey.display()))?
         .trim()
         .to_string();
-    // Per-process, so two concurrent `ssh` runs against one state dir cannot
-    // stage over each other.
-    let scratch = state.ssh_dir().join(format!("scratch.{}", std::process::id()));
 
     let blob = key_blob(&pubkey_line)
         .with_context(|| format!("{} is not an ssh public key", pubkey.display()))?;
     let line = authorized_line(&cfg.key_options, SystemTime::now() + cfg.key_ttl, &pubkey_line);
-    install_authorized_key(state, &cfg, blob, &line, &scratch).await?;
-    let host_key = fetch_host_key(state, &cfg, &scratch).await?;
+    install_authorized_key(state, cfg, blob, &line, scratch).await?;
+    let host_key = fetch_host_key(state, cfg, scratch).await?;
 
     let local: SocketAddr = ([127, 0, 0, 1], cfg.local_port).into();
     let (bound, forwarder) = controller::forward_listener(
@@ -68,7 +82,7 @@ pub async fn run(state: &StateDir, cfg: Config) -> Result<i32> {
     )
     .await?;
 
-    ensure_sshd(state, &cfg, bound).await?;
+    ensure_sshd(state, cfg, bound).await?;
 
     // known_hosts is keyed by the forwarded port, which changes per invocation,
     // so it is rewritten rather than appended to. ssh only looks up the bracketed
@@ -103,7 +117,6 @@ pub async fn run(state: &StateDir, cfg: Config) -> Result<i32> {
         .await
         .context("running ssh (is an ssh client installed on the controller?)")?;
     forwarder.abort();
-    let _ = std::fs::remove_file(&scratch);
     Ok(status.code().unwrap_or(255))
 }
 
@@ -153,16 +166,38 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 /// Every line carrying this key blob is dropped before the new one goes in, so
-/// a rerun renews the expiry instead of stacking a line per run.
-fn merge_authorized_keys(existing: &str, blob: &str, line: &str) -> String {
-    let mut body: String = existing
-        .lines()
-        .filter(|l| !l.split_whitespace().any(|f| f == blob))
-        .map(|l| format!("{l}\n"))
-        .collect();
-    body.push_str(line);
-    body.push('\n');
-    body
+/// a rerun renews the expiry instead of stacking a line per run. Line by line,
+/// so the file the target hands back is never held whole.
+async fn merge_authorized_keys<R, W>(
+    existing: Option<R>,
+    out: &mut W,
+    blob: &str,
+    line: &str,
+) -> Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = Vec::new();
+    if let Some(mut existing) = existing {
+        loop {
+            buf.clear();
+            if existing.read_until(b'\n', &mut buf).await? == 0 {
+                break;
+            }
+            if buf.split(|b| b.is_ascii_whitespace()).any(|f| f == blob.as_bytes()) {
+                continue;
+            }
+            out.write_all(&buf).await?;
+            if buf.last() != Some(&b'\n') {
+                out.write_all(b"\n").await?;
+            }
+        }
+    }
+    out.write_all(line.as_bytes()).await?;
+    out.write_all(b"\n").await?;
+    out.flush().await?;
+    Ok(())
 }
 
 /// pull + edit + push: whatever else the target's authorized_keys holds is
@@ -174,21 +209,25 @@ async fn install_authorized_key(
     line: &str,
     scratch: &Path,
 ) -> Result<()> {
-    let existing = controller::pull_bytes(state, &cfg.agent, &cfg.authorized_keys, scratch).await?;
-    let existing = existing
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
-        .unwrap_or_default();
-    let body = merge_authorized_keys(&existing, blob, line);
-    controller::push_bytes(
-        state,
-        &cfg.agent,
-        &cfg.authorized_keys,
-        body.as_bytes(),
-        0o600,
-        scratch,
-    )
-    .await
-    .context("installing the authorized key")?;
+    let pulled = scratch.join("authorized_keys");
+    let existing =
+        match controller::pull_file(state, &cfg.agent, &cfg.authorized_keys, &pulled, KEY_FILE_MAX_BYTES)
+            .await?
+        {
+            Pulled::Fetched { .. } => Some(BufReader::new(tokio::fs::File::open(&pulled).await?)),
+            Pulled::Missing => None,
+        };
+    let merged = scratch.join("authorized_keys.merged");
+    let mut out = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&merged)
+        .await?;
+    merge_authorized_keys(existing, &mut out, blob, line).await?;
+    controller::push_file(state, &cfg.agent, &merged, &cfg.authorized_keys)
+        .await
+        .context("installing the authorized key")?;
     eprintln!("egdod: installed at {}: {line}", cfg.authorized_keys);
     Ok(())
 }
@@ -212,12 +251,18 @@ async fn fetch_host_key(state: &StateDir, cfg: &Config, scratch: &Path) -> Resul
 }
 
 async fn read_host_key(state: &StateDir, cfg: &Config, scratch: &Path) -> Result<Option<String>> {
-    let Some(raw) = controller::pull_bytes(state, &cfg.agent, &cfg.host_key_pub, scratch).await?
-    else {
+    let pulled = scratch.join("host_key.pub");
+    if let Pulled::Missing =
+        controller::pull_file(state, &cfg.agent, &cfg.host_key_pub, &pulled, KEY_FILE_MAX_BYTES).await?
+    {
         return Ok(None);
-    };
-    let text = String::from_utf8_lossy(&raw);
-    let mut fields = text.split_whitespace();
+    }
+    let mut first = Vec::new();
+    BufReader::new(tokio::fs::File::open(&pulled).await?)
+        .read_until(b'\n', &mut first)
+        .await?;
+    let first = String::from_utf8_lossy(&first);
+    let mut fields = first.split_whitespace();
     match (fields.next(), fields.next()) {
         // The trailing comment is dropped: known_hosts only needs type and key.
         (Some(kind), Some(blob)) => Ok(Some(format!("{kind} {blob}"))),
@@ -289,16 +334,25 @@ mod tests {
         assert_eq!(utc_yyyymmddhhmm(last_minute), "200002292359Z");
     }
 
-    #[test]
-    fn rerun_replaces_by_blob_and_keeps_strangers() {
+    async fn merged(existing: Option<&str>, blob: &str, line: &str) -> String {
+        let mut out = Vec::new();
+        merge_authorized_keys(existing.map(str::as_bytes), &mut out, blob, line)
+            .await
+            .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rerun_replaces_by_blob_and_keeps_strangers() {
         let blob = key_blob(PK).unwrap();
         let stale = format!(r#"expiry-time="202601010000Z" {PK}"#);
         let other = "ssh-rsa AAAAB3other someone-else";
         let fresh = format!(r#"expiry-time="202701010000Z" {PK}"#);
-        let once = merge_authorized_keys(&format!("{other}\n{stale}"), blob, &fresh);
+        let once = merged(Some(&format!("{other}\n{stale}")), blob, &fresh).await;
         assert_eq!(once, format!("{other}\n{fresh}\n"));
-        assert_eq!(merge_authorized_keys(&once, blob, &fresh), once);
-        assert_eq!(merge_authorized_keys("", blob, &fresh), format!("{fresh}\n"));
-        assert_eq!(merge_authorized_keys(other, blob, &fresh), format!("{other}\n{fresh}\n"));
+        assert_eq!(merged(Some(&once), blob, &fresh).await, once);
+        assert_eq!(merged(Some(""), blob, &fresh).await, format!("{fresh}\n"));
+        assert_eq!(merged(None, blob, &fresh).await, format!("{fresh}\n"));
+        assert_eq!(merged(Some(other), blob, &fresh).await, format!("{other}\n{fresh}\n"));
     }
 }

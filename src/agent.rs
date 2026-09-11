@@ -195,7 +195,10 @@ async fn handle(mut send: SendStream, mut recv: RecvStream) -> Result<()> {
             sha256,
         } => {
             let dest = PathBuf::from(&path);
-            let result = recv_file_body(&mut recv, &dest, len, sha256, mode).await;
+            // No ceiling this way: the sender is the controller, which QUIC has
+            // already authenticated and which holds root here regardless.
+            let result =
+                recv_file_body(&mut recv, &dest, len, sha256, mode, u64::MAX).await;
             let ack = match &result {
                 Ok(()) => {
                     tracing::info!(%path, len, "received file");

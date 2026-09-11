@@ -93,12 +93,12 @@ ask for revocation and it was left alone rather than half-built.
 - **Nothing has been tested across two machines.** Both ends of every session
   were on one host, so NAT traversal — the reason the agent dials out — rests on
   the prior art rather than on this code.
-- **An approved agent can make the controller write unbounded data** by lying
-  about a file's length on `pull` — and since it chooses both the length and the
-  digest, the oversized transfer *succeeds* rather than tripping the check. On
-  the ssh path the same lie drives unbounded controller memory, because
-  `pull_bytes` reads the staged file whole. Approved targets are untrusted
-  hardware by design, so this is a real hole, not a theoretical one.
+- **An approved agent can still make the controller buffer unbounded `exec`
+  output** on the ssh path: the recipe's two captured commands collect every
+  output frame into memory with no ceiling (egdod#8). The `pull` door is shut
+  — `recv_file_body` refuses a declared length over `--max-bytes` before
+  anything exists, checks free space first, and the recipe streams what it
+  pulls (`PROOF.md`, "A lying target cannot fill the controller").
 - **No revocation**, and no way to signal or kill a running `exec`.
 - **Nothing has run on aarch64**, so property 6 is respected by construction and
   unverified by observation.

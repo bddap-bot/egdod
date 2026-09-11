@@ -236,16 +236,25 @@ where
 /// Streams the rest of `r` into `dest`, verifying length and digest before the
 /// destination path is allowed to exist: a truncated or corrupted transfer
 /// leaves the target untouched rather than half-written.
+///
+/// `max` is the receiver's ceiling: on `pull` the sender is an approved target,
+/// untrusted hardware that chooses both the length and the digest, so its
+/// declaration bounds nothing and a lie must cost the receiver no disk at all.
 pub async fn recv_file_body<R>(
     r: &mut R,
     dest: &Path,
     len: u64,
     sha256: [u8; 32],
     mode: u32,
+    max: u64,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
+    ensure!(
+        len <= max,
+        "peer declared {len} bytes, over the {max}-byte ceiling"
+    );
     ensure!(
         dest.file_name().is_some(),
         "{} is not a file path",
@@ -253,13 +262,14 @@ where
     );
     // The agent may be writing into a directory that does not exist yet and has
     // no shell available to create one.
-    if let Some(parent) = dest.parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-    }
+    let dir = match dest.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    tokio::fs::create_dir_all(dir)
+        .await
+        .with_context(|| format!("creating {}", dir.display()))?;
+    ensure_free_space(dir, len)?;
     let (tmp, mut out) = create_part_file(dest).await?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; CHUNK];
@@ -343,6 +353,25 @@ async fn create_part_file(dest: &Path) -> Result<(PathBuf, tokio::fs::File)> {
     bail!("could not create a staging file next to {}", dest.display())
 }
 
+/// A filesystem that reports no blocks at all (ramfs, a plain initramfs) keeps
+/// no accounting, so it is not "full"; and the count is `f_bfree`, not
+/// `f_bavail`, because the writer on the target is root and the reserve is its
+/// to use. Over-admitting by that reserve on the controller side only moves the
+/// failure to ENOSPC mid-stream, which already cleans up after itself.
+fn ensure_free_space(dir: &Path, len: u64) -> Result<()> {
+    let fs = rustix::fs::statvfs(dir).with_context(|| format!("statvfs {}", dir.display()))?;
+    if fs.f_blocks == 0 {
+        return Ok(());
+    }
+    let free = fs.f_bfree.saturating_mul(fs.f_frsize);
+    ensure!(
+        len <= free,
+        "peer declared {len} bytes but the filesystem holding {} has {free} free",
+        dir.display()
+    );
+    Ok(())
+}
+
 pub async fn set_mode(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
@@ -418,7 +447,9 @@ mod tests {
             finish(&mut w).await.unwrap();
         });
         let dest = dir.path().join("nested/dest.bin");
-        recv_file_body(&mut r, &dest, len, sha, mode).await.unwrap();
+        recv_file_body(&mut r, &dest, len, sha, mode, len)
+            .await
+            .unwrap();
         sender.await.unwrap();
         assert_eq!(tokio::fs::read(&dest).await.unwrap(), body);
         assert_eq!(stat_and_hash(&dest).await.unwrap(), (mode, len, sha));
@@ -433,7 +464,7 @@ mod tests {
             w.write_all(b"tampered").await.unwrap();
             finish(&mut w).await.unwrap();
         });
-        let err = recv_file_body(&mut r, &dest, 8, [0u8; 32], 0o644)
+        let err = recv_file_body(&mut r, &dest, 8, [0u8; 32], 0o644, u64::MAX)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("sha256 mismatch"), "{err}");
@@ -456,20 +487,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overlong_transfer_is_cut_off() {
+    async fn lying_stream_is_cut_at_the_announced_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("dest.bin");
+        let (mut w, mut r) = tokio::io::duplex(4096);
+        let sender = tokio::spawn(async move {
+            let mut accepted = 0usize;
+            while accepted < 1 << 20 {
+                if w.write_all(&[0u8; 4096]).await.is_err() {
+                    break;
+                }
+                accepted += 4096;
+            }
+            accepted
+        });
+        let err = recv_file_body(&mut r, &dest, 4, [0u8; 32], 0o644, u64::MAX)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("more than the announced"), "{err}");
+        drop(r);
+        let accepted = sender.await.unwrap();
+        assert!(accepted <= 4 * 4096, "the receiver kept reading: {accepted} bytes");
+        assert!(!dest.exists());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[tokio::test]
+    async fn declared_over_the_ceiling_is_refused_unwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("nested/dest.bin");
+        let body = b"12345";
+        let sha: [u8; 32] = Sha256::digest(body).into();
+        let (mut w, mut r) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            w.write_all(body).await.unwrap();
+            finish(&mut w).await.unwrap();
+        });
+        let err = recv_file_body(&mut r, &dest, 5, sha, 0o644, 4)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("ceiling"), "{err}");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let mut unread = Vec::new();
+        r.read_to_end(&mut unread).await.unwrap();
+        assert_eq!(unread, body, "the refusal consumed the stream");
+    }
+
+    #[tokio::test]
+    async fn free_space_is_checked_before_anything_is_created() {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("dest.bin");
         let (mut w, mut r) = tokio::io::duplex(4096);
         tokio::spawn(async move {
-            // Announced 4 bytes, sends far more: the receiver must not write it all.
-            let _ = w.write_all(&vec![0u8; 1 << 20]).await;
-            let _ = finish(&mut w).await;
+            w.write_all(b"x").await.unwrap();
+            finish(&mut w).await.unwrap();
         });
-        let err = recv_file_body(&mut r, &dest, 4, [0u8; 32], 0o644)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("more than the announced"), "{err}");
-        assert!(!dest.exists());
+        // Unwritable, so a staging file created ahead of the check surfaces as a
+        // different error instead of being silently unlinked again.
+        set_mode(dir.path(), 0o500).await.unwrap();
+        let outcome = recv_file_body(&mut r, &dest, 1 << 60, [0u8; 32], 0o644, u64::MAX).await;
+        set_mode(dir.path(), 0o700).await.unwrap();
+        let err = outcome.unwrap_err();
+        assert!(err.to_string().contains("free"), "{err}");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let mut unread = Vec::new();
+        r.read_to_end(&mut unread).await.unwrap();
+        assert_eq!(unread, b"x", "the refusal consumed the stream");
     }
 
     #[tokio::test]
@@ -486,7 +572,7 @@ mod tests {
             h.update(b"abcdef");
             (0u32, 6u64, <[u8; 32]>::from(h.finalize()))
         };
-        let err = recv_file_body(&mut r, &dest, 6, sha, 0o644)
+        let err = recv_file_body(&mut r, &dest, 6, sha, 0o644, u64::MAX)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("expected 6 bytes"), "{err}");

@@ -104,6 +104,9 @@ enum ControllerCmd {
         agent: String,
         remote: String,
         local: PathBuf,
+        /// Refuse a file the target declares larger than this many bytes.
+        #[arg(long, default_value_t = controller::DEFAULT_MAX_BYTES)]
+        max_bytes: u64,
     },
     /// Tunnel a local TCP port to an address on the target.
     Forward {
@@ -214,7 +217,8 @@ async fn run_controller(state: StateDir, cmd: ControllerCmd) -> Result<()> {
             agent,
             remote,
             local,
-        } => controller::pull(&state, &agent, &remote, &local).await,
+            max_bytes,
+        } => controller::pull(&state, &agent, &remote, &local, max_bytes).await,
         ControllerCmd::Forward {
             agent,
             local_port,
