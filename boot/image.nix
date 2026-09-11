@@ -1,18 +1,14 @@
 { controllerNodeId ? "0000000000000000000000000000000000000000000000000000000000000000"
 , direct ? ""
 , relay ? ""
-, noRelay ? true
 , dhcp ? false
 , ip ? "10.0.2.15"
 , gw ? "10.0.2.2"
 , mask ? "255.255.255.0"
 }:
+assert direct != "" -> relay == "";
 let
-  nixpkgs = builtins.fetchTarball {
-    url = "https://github.com/NixOS/nixpkgs/archive/e2587caef70cea85dd97d7daab492899902dbf5d.tar.gz";
-    sha256 = "14jrgz4z2m8n1c8qwcla44kdy9kd7x0xnwfyrajnyvnhkxbnnqf1";
-  };
-  pkgs = import nixpkgs { };
+  pkgs = import ../nixpkgs.nix;
   agent = import ../musl.nix;
 
   shim = pkgs.fetchurl {
@@ -32,14 +28,13 @@ let
   };
 
   krel = "6.12.96+deb13-amd64";
-  relayArg = pkgs.lib.optionalString (relay != "") " egdod.relay=${relay}";
-  directArg = pkgs.lib.optionalString (direct != "") " egdod.direct=${direct}";
-  noRelayArg = pkgs.lib.optionalString noRelay " egdod.norelay";
+  dialArg = if direct != "" then " egdod.direct=${direct} egdod.norelay"
+            else if relay != "" then " egdod.relay=${relay}"
+            else "";
   netArg = if dhcp then " egdod.dhcp"
            else " egdod.ip=${ip} egdod.gw=${gw} egdod.mask=${mask}";
   cmdline = "console=ttyS0,115200 egdod.controller=${controllerNodeId}"
-    + netArg + " egdod.mods=/e1000.ko,/efivarfs.ko"
-    + relayArg + directArg + noRelayArg;
+    + netArg + " egdod.mods=/e1000.ko,/efivarfs.ko" + dialArg;
 in
 pkgs.stdenv.mkDerivation {
   name = "egdod-stick";
@@ -71,7 +66,7 @@ pkgs.stdenv.mkDerivation {
     xz -dc "$MODS/fs/efivarfs/efivarfs.ko.xz" > rootfs/efivarfs.ko
     ( cd rootfs && find . -print0 | cpio --null -H newc -o 2>/dev/null | gzip -9 ) > initrd.img
 
-    mkdir -p esp/EFI/BOOT esp/EFI/debian esp/boot/grub
+    mkdir -p esp/EFI/BOOT esp/EFI/debian
     cp "$SHIM"    esp/EFI/BOOT/BOOTX64.EFI
     cp "$GRUB"    esp/EFI/BOOT/grubx64.efi
     cp "$VMLINUZ" esp/vmlinuz
@@ -88,8 +83,6 @@ pkgs.stdenv.mkDerivation {
     }
     CFG
     sed 's/^    //' cfg > esp/EFI/debian/grub.cfg
-    cp esp/EFI/debian/grub.cfg esp/EFI/BOOT/grub.cfg
-    cp esp/EFI/debian/grub.cfg esp/boot/grub/grub.cfg
 
     dd if=/dev/zero of=esp.img bs=1M count=96 status=none
     mkfs.vfat esp.img >/dev/null

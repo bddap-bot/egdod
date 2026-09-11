@@ -12,6 +12,16 @@
     },
     {
       "paths": [
+        "nixpkgs.nix"
+      ],
+      "tests": [
+        "nix-build musl.nix -o result-gate",
+        "nix-build boot/image.nix -o result-boot-gate"
+      ],
+      "why": "the single pinned nixpkgs every nix build in the repo imports — changing it must still build both the static agent and the stick image"
+    },
+    {
+      "paths": [
         "boot/init.c",
         "boot/image.nix"
       ],
