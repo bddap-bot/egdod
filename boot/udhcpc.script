@@ -1,0 +1,10 @@
+#!/bin/busybox sh
+case "$1" in
+  bound|renew)
+    /bin/busybox ifconfig "$interface" "$ip" netmask "$subnet"
+    [ -n "$router" ] && /bin/busybox route add default gw "$router"
+    /bin/busybox mkdir -p /etc
+    : > /etc/resolv.conf
+    for d in $dns; do /bin/busybox printf 'nameserver %s\n' "$d" >> /etc/resolv.conf; done
+    ;;
+esac

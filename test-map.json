@@ -31,6 +31,15 @@
     },
     {
       "paths": [
+        "boot/udhcpc.script"
+      ],
+      "tests": [
+        "bash -n boot/udhcpc.script"
+      ],
+      "why": "the busybox-sh DHCP lease-apply script baked into the initramfs — a full exercise needs a booted VM and a DHCP server, so the gate checks syntax only"
+    },
+    {
+      "paths": [
         "**/*.md",
         "**/LICENSE-*",
         ".gitignore"

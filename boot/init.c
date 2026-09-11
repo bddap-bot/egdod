@@ -90,7 +90,30 @@ static void default_route(int fd, const char *dev, const char *gw) {
     if (ioctl(fd, SIOCADDRT, &rt)) printf("init: route via %s errno=%d\n", gw, errno);
 }
 
+static void dhcp(const char *dev) {
+    int up = socket(AF_INET, SOCK_DGRAM, 0);
+    iface_up(up, "lo");
+    iface_up(up, dev);
+    close(up);
+    mkdir("/etc", 0755);
+    pid_t p = fork();
+    if (p == 0) {
+        char *av[] = { "/bin/busybox", "udhcpc", "-i", (char *)dev, "-n", "-q",
+                       "-s", "/bin/udhcpc.script", NULL };
+        execv(av[0], av);
+        _exit(127);
+    }
+    int st;
+    waitpid(p, &st, 0);
+    if (st) printf("init: udhcpc exit status=%d\n", st);
+}
+
 static void network(void) {
+    if (flag("egdod.dhcp")) {
+        char *dev = arg("egdod.dev") ? dup_word(arg("egdod.dev")) : strdup("eth0");
+        dhcp(dev);
+        return;
+    }
     const char *ip = arg("egdod.ip");
     if (!ip) return;
     char *dev = arg("egdod.dev") ? dup_word(arg("egdod.dev")) : strdup("eth0");
