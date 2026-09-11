@@ -30,8 +30,15 @@ three primitives, approval by public key, and the ssh recipe, all over real iroh
 separately, a target that knows only a node id finding its controller through a public relay. See
 `PROOF.md`, which separates what was watched happening from what is merely believed, and is careful
 about which of those ran where. The static binary meant for a machine with no userland completes
-that same approve-and-exec loop, hermetically on loopback (`PROOF.md`, demo step 18). What does not work yet is the boot: there is no image to
-put it on, and nothing has been tested across two machines. `SPEC.md`
+that same approve-and-exec loop, hermetically on loopback (`PROOF.md`, demo step 18).
+
+The boot now exists too. `boot/image.nix` builds a stick image from a
+distro-signed chain plus our own unsigned initramfs, and `boot/run-boot.sh` was
+watched booting it under OVMF with Secure Boot enforcing: the agent runs as PID
+1, dials out, is approved, runs a command as root inside the machine, and then
+receives a root filesystem over the wire and `switch_root`s into it. What is not
+yet watched is a boot on real hardware, whose firmware is not OVMF, and a
+session across two genuinely separate machines. `SPEC.md`
 is the contract; `INTEGRATION.md` says how two competing implementations became this one, and what
 is still owed.
 

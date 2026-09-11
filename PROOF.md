@@ -16,6 +16,8 @@ this repo has paid for that twice.
 nix-shell --run 'cargo test'
 nix-build musl.nix -o /tmp/egdod-musl-result                     # the static agent
 EGDOD_MUSL_BIN=/tmp/egdod-musl-result/bin/egdod nix-shell --run './demo.sh'
+bash boot/run-boot.sh                                            # boot under Secure Boot, end to end
+EGDOD_BOOT_DHCP=1 bash boot/run-boot.sh                          # same, bringing the link up by DHCP
 ```
 
 `demo.sh` steps 0-14 are hermetic. Steps 15-17 use n0's public relay and DNS.
@@ -468,6 +470,62 @@ vendor/noq-udp/Cargo.toml --lib`) that decode and encode through a musl-shaped
 align-4 cmsghdr with a deliberately misaligned `timespec` payload — verified to
 fail against the upstream code and pass against the patch.
 
+### The boot: Secure Boot on, dial-out, exec as root, and switch_root
+
+`boot/run-boot.sh` was watched carrying the whole arc on one host, with the
+agent inside a virtual machine and the controller outside it. `boot/image.nix`
+builds the stick image from a distro-signed chain pinned by sha256 — Debian's
+Microsoft-signed shim, Debian-signed grub and `vmlinuz` 6.12.96 — plus an
+unsigned initramfs whose PID 1 is `boot/init.c`, which launches the static musl
+agent. The image boots under OVMF with the Microsoft keys enrolled.
+
+Secure Boot was enforcing, watched from three sides at once. The firmware and
+shim: the boot reached grub and the kernel only through the signed chain (a
+byte-flipped shim is refused by the firmware, a byte-flipped grub by shim — the
+controls proven in the prior art this rides on). The kernel, on the serial
+console: `EFI stub: UEFI Secure Boot is enabled`, `Kernel is locked down from
+EFI Secure Boot`, `secureboot: Secure boot enabled`, and the Debian Secure Boot
+CA loaded into the integrity keyring. And the firmware's own record, read from
+inside the booted guest through efivarfs: the `SecureBoot` variable is
+`06 00 00 00 01` — value `01`.
+
+```
+init: egdod PID 1 up, launching agent
+agent pubkey: 033e2c67119981f7f51f1e9e040f6b356514cb26de46304903d7337b1a31d74d
+...
+uid seen by exec: 0
+Linux (none) 6.12.96+deb13-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.12.96-1 x86_64 GNU/Linux
+egdod: session with 033e2c67... via direct-lan (192.168.1.141:58356)
+```
+
+e1000 came up (statically, and separately by DHCP against qemu's own server —
+`lease of 10.0.2.15 obtained`), the agent dialed out and printed its key on the
+serial console, an unapproved agent was served nothing, and after approval the
+controller ran commands as root inside the guest: `id -u` returned `0`, `uname`
+and the baked command line came back, and the session reported a direct path,
+never relayed.
+
+Then the received-OS handoff, watched end to end: the controller pushed a
+rootfs tarball (sha256 verified by the copy primitive), an `exec` mounted a
+tmpfs and unpacked into it and armed `/switch.req`, and PID 1 moved that tmpfs
+to `/` and exec'd the init inside it. The received init announced itself on the
+serial console — `NEWROOT-INIT: switch_root landed; the received OS is PID 1
+now` — and read `/proc/version` to show the same kernel, no kexec. The move is
+`MS_MOVE` plus `chroot`, the one root-replacement lockdown permits: `pivot_root`
+`EINVAL`s on an initramfs and `kexec` of an unsigned kernel is refused
+`ENOKEY`, both established in the prior art.
+
+Finally the image was written to a USB stick and read back: the sha256 of the
+written span equals the sha256 of the image.
+
+**Not watched here.** The vendor firmware half — this was OVMF, not a laptop's
+own UEFI, whose `db` contents, Fast Boot and removable-media handling vary; the
+stick settles that only when it is moved to real hardware and booted. And the
+relay half of the stick's own configuration: the written stick is set for DHCP
+and finds its controller by node id through the public relay, but only the
+`--no-relay --direct` path and a DHCP lease were observed in the VM — the
+relay dial-in on real hardware is the next thing to watch, not a thing watched.
+
 ## What the agent needs from its environment
 
 `SPEC.md` property 4 asks for this to be written down here, and made explicit on
@@ -524,8 +582,10 @@ anything specified:
   not.
 - **`direct-wan`.** Three of the four labels were produced. A direct
   internet-routed path needs two hosts.
-- **An actual boot.** No initramfs, no image, nothing started from a stick. See
-  `INTEGRATION.md` for the distance.
+- **A boot on real hardware.** The image boots under OVMF with Secure Boot on,
+  the agent runs as PID 1, and the switch_root handoff works (see PROVED above),
+  but a laptop's own firmware is not OVMF. The stick is written; the boot on a
+  physical Secure-Boot machine is the outstanding test.
 - **aarch64, and the phone.** Property 6 constrains the design — all state under
   one `--state-dir`, `pending --json`, `status --json`, no root, no systemd, no
   fixed paths — and the design respects it, but nothing was built or run on
@@ -566,7 +626,8 @@ next round of proving.
 - **An initramfs agent needs approving once per boot.** The agent's key lives at
   `--key-file`; on a tmpfs that is gone at reboot, so a new key is generated and
   the target arrives pending again. Nothing secret is lost — the cost is a
-  re-approval. Untested, because nothing has booted.
+  re-approval. Now observed rather than reasoned: each boot in `run-boot.sh`
+  printed a fresh pubkey that had to be approved.
 - **The canary's same-host blind spot.** In `Direct` mode the probe is handed
   the controller's own addresses and dials over loopback, so it proves the socket
   answers and nothing about whether a stranger elsewhere could reach it;
