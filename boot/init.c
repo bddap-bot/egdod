@@ -143,7 +143,24 @@ int main(void) {
     char *ml = mods ? dup_word(mods) : strdup("/e1000.ko");
     for (char *tok = strtok(ml, ","); tok; tok = strtok(NULL, ",")) load_module(tok);
 
+    mkdir("/sys/firmware", 0755);
+    mkdir("/sys/firmware/efi", 0755);
+    mkdir("/sys/firmware/efi/efivars", 0755);
+    mount("efivarfs", "/sys/firmware/efi/efivars", "efivarfs", 0, NULL);
+
     network();
+
+    setenv("PATH", "/bin", 1);
+    if (access("/bin/busybox", X_OK) == 0) {
+        pid_t bp = fork();
+        if (bp == 0) {
+            char *bv[] = { "/bin/busybox", "--install", "-s", "/bin", NULL };
+            execv(bv[0], bv);
+            _exit(127);
+        }
+        int bs;
+        waitpid(bp, &bs, 0);
+    }
 
     printf("init: egdod PID 1 up, launching agent\n");
     fflush(stdout);

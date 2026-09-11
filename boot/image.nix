@@ -35,7 +35,7 @@ let
   directArg = pkgs.lib.optionalString (direct != "") " egdod.direct=${direct}";
   noRelayArg = pkgs.lib.optionalString noRelay " egdod.norelay";
   cmdline = "console=ttyS0,115200 egdod.controller=${controllerNodeId}"
-    + " egdod.ip=${ip} egdod.gw=${gw} egdod.mask=${mask} egdod.mods=/e1000.ko"
+    + " egdod.ip=${ip} egdod.gw=${gw} egdod.mask=${mask} egdod.mods=/e1000.ko,/efivarfs.ko"
     + relayArg + directArg + noRelayArg;
 in
 pkgs.stdenv.mkDerivation {
@@ -60,7 +60,10 @@ pkgs.stdenv.mkDerivation {
     mkdir -p rootfs
     cp init rootfs/init
     cp ${agent}/bin/egdod rootfs/egdod
+    mkdir -p rootfs/bin
+    cp ${pkgs.pkgsStatic.busybox}/bin/busybox rootfs/bin/busybox
     xz -dc "$MODS/drivers/net/ethernet/intel/e1000/e1000.ko.xz" > rootfs/e1000.ko
+    xz -dc "$MODS/fs/efivarfs/efivarfs.ko.xz" > rootfs/efivarfs.ko
     ( cd rootfs && find . -print0 | cpio --null -H newc -o 2>/dev/null | gzip -9 ) > initrd.img
 
     mkdir -p esp/EFI/BOOT esp/EFI/debian esp/boot/grub
