@@ -97,16 +97,21 @@ ask for revocation and it was left alone rather than half-built.
 - **Nothing has run on aarch64**, so property 6 is respected by construction and
   unverified by observation.
 
-## How far from booting a machine off a stick
+## Booting a machine off a stick
 
-Further than the working demo suggests, and the missing pieces are mostly not
-in this repo. `egdod` is the process that runs *after* something has already
-brought a machine to the point of executing a Linux binary with a configured
-network interface. To boot a stick you still need: a kernel and an initramfs
-with this binary as `init`; a static binary that survives a datagram, which is
-the gap above; NIC driver modules and something to bring the link up and get an
-address, because nothing here does DHCP and the agent assumes an interface that
-already works; and a stick image to put it all on. `SPEC.md` puts image
-building, installers and partitioning out of scope for v0 deliberately — so the
-honest statement is that v0 is the *protocol* proven on a machine that already
-booted, and the stick is the next increment, not a remaining detail of this one.
+`SPEC.md` puts image building out of scope for v0, so v0 is the protocol proven
+on a machine that already booted. The boot itself is now built and watched, in
+`boot/` and in `PROOF.md`. The pieces that account said were missing are there:
+a kernel and an initramfs with the agent as `init`; the static binary that
+survives a datagram; the NIC driver and both ways to bring the link up, static
+and DHCP; and a stick image, produced by a nix derivation from a distro-signed
+chain pinned by hash. `boot/run-boot.sh` boots it under OVMF with Secure Boot
+enforcing, the agent dials out and is approved and runs as root, and the
+initramfs receives a root filesystem over the wire and `switch_root`s into it.
+`boot/write-stick.sh` writes the image to a real device with byte-for-byte
+readback.
+
+What is left is not in this repo's control: a boot on a physical Secure-Boot
+machine, whose firmware is not OVMF, and a session across two genuinely separate
+networks. The stick is written for that test; until it runs, "boots under Secure
+Boot" means "boots under OVMF with Microsoft keys".
