@@ -40,6 +40,15 @@
     },
     {
       "paths": [
+        "boot/write-stick.sh"
+      ],
+      "tests": [
+        "bash -n boot/write-stick.sh"
+      ],
+      "why": "the guarded physical-stick writer — it writes a real block device and demands an unmounted ~30G USB disk, so the gate checks syntax only"
+    },
+    {
+      "paths": [
         "**/*.md",
         "**/LICENSE-*",
         ".gitignore"
