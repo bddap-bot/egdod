@@ -17,6 +17,9 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWr
 /// Ceiling on what the recipe pulls from the target: an `authorized_keys` and
 /// a host key are a few lines each, so anything larger is not that file.
 const KEY_FILE_MAX_BYTES: u64 = 1 << 20;
+/// Ceiling on what the recipe captures from an exec: key generation and an sshd
+/// start report a line or a few, never a bulk stream.
+const EXEC_OUTPUT_MAX_BYTES: u64 = 1 << 16;
 
 pub struct Config {
     pub agent: String,
@@ -238,7 +241,8 @@ async fn fetch_host_key(state: &StateDir, cfg: &Config, scratch: &Path) -> Resul
     }
     eprintln!("egdod: no host key on the target; generating one with {:?}", cfg.keygen_argv);
     let (code, _out, err) =
-        controller::exec_capture(state, &cfg.agent, cfg.keygen_argv.clone()).await?;
+        controller::exec_capture(state, &cfg.agent, cfg.keygen_argv.clone(), EXEC_OUTPUT_MAX_BYTES)
+            .await?;
     if code != 0 {
         bail!(
             "host key generation failed on the target (exit {code}): {}",
@@ -279,7 +283,8 @@ async fn ensure_sshd(state: &StateDir, cfg: &Config, bound: SocketAddr) -> Resul
     }
     eprintln!("egdod: no sshd answering; starting it with {:?}", cfg.sshd_argv);
     let (code, _out, err) =
-        controller::exec_capture(state, &cfg.agent, cfg.sshd_argv.clone()).await?;
+        controller::exec_capture(state, &cfg.agent, cfg.sshd_argv.clone(), EXEC_OUTPUT_MAX_BYTES)
+            .await?;
     if code != 0 {
         bail!(
             "starting sshd failed (exit {code}): {}",

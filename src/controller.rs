@@ -9,8 +9,8 @@
 use crate::net::{self, Lookup, ProbeMode, RelayChoice};
 use crate::pipe::splice;
 use crate::proto::{
-    finish, hex, read_msg, read_msg_opt, recv_file_body, send_file_body, stat_and_hash, write_msg,
-    Ack, ExecFrame, PullStart, Request, Route, RouteReply, ALPN, CLOSE_PENDING,
+    finish, hex, read_msg, recv_exec_output, recv_file_body, send_file_body,
+    stat_and_hash, write_msg, Ack, PullStart, Request, Route, RouteReply, ALPN, CLOSE_PENDING,
     PROBE_ALPN, PROBE_PING, PROBE_PONG,
 };
 use crate::state::{now_unix, SessionInfo, StateDir, Status};
@@ -23,7 +23,6 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
@@ -475,13 +474,14 @@ async fn route(state: &StateDir, agent: &str) -> Result<Routed> {
 /// and returns the target's exit status.
 ///
 /// The command and the ssh recipe share this one implementation; they differ only
-/// in the sinks they hand it (a terminal, or a buffer).
+/// in the sinks they hand it (a terminal, or a buffer) and what those can afford.
 pub async fn exec_into<O, E>(
     state: &StateDir,
     agent: &str,
     argv: Vec<String>,
     out: &mut O,
     err: &mut E,
+    max: u64,
 ) -> Result<i32>
 where
     O: tokio::io::AsyncWrite + Unpin,
@@ -490,37 +490,13 @@ where
     let mut r = route(state, agent).await?;
     write_msg(&mut r.write, &Request::Exec { argv }).await?;
     finish(&mut r.write).await?;
-    let mut code = None;
-    let mut truncated = false;
-    while let Some(frame) = read_msg_opt::<_, ExecFrame>(&mut r.read).await? {
-        match frame {
-            ExecFrame::Stdout(b) => out.write_all(&b).await?,
-            ExecFrame::Stderr(b) => err.write_all(&b).await?,
-            ExecFrame::Exit(c) => code = Some(c),
-            ExecFrame::Failed(e) => bail!("exec failed on the target: {e}"),
-            ExecFrame::Truncated => truncated = true,
-        }
-    }
-    out.flush().await?;
-    err.flush().await?;
-    // Said out loud, because the exit status is about the command and says
-    // nothing about whether its output arrived whole. Hedged, because the usual
-    // cause is a daemon the command left holding the pipes, in which case the
-    // output above is complete and only the agent's certainty is missing.
-    if truncated {
-        tracing::warn!(
-            "the target stopped reading this command's output before end of file \
-             (usually a daemon it started still holds the pipes); the output above \
-             may be incomplete"
-        );
-    }
-    code.context("agent closed the stream without reporting an exit status")
+    recv_exec_output(&mut r.read, out, err, max).await
 }
 
 /// Returns the target's exit status so the caller can exit with it.
 pub async fn exec(state: &StateDir, agent: &str, argv: Vec<String>) -> Result<i32> {
     let (mut out, mut err) = (tokio::io::stdout(), tokio::io::stderr());
-    exec_into(state, agent, argv, &mut out, &mut err).await
+    exec_into(state, agent, argv, &mut out, &mut err, u64::MAX).await
 }
 
 /// Sends a local file, returning what the target now holds.
@@ -792,8 +768,9 @@ pub async fn exec_capture(
     state: &StateDir,
     agent: &str,
     argv: Vec<String>,
+    max: u64,
 ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    let code = exec_into(state, agent, argv, &mut out, &mut err).await?;
+    let code = exec_into(state, agent, argv, &mut out, &mut err, max).await?;
     Ok((code, out, err))
 }

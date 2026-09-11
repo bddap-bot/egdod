@@ -233,6 +233,60 @@ where
     Ok(())
 }
 
+/// The one receiver for a command's frames, feeding `out` and `err` as they arrive.
+///
+/// `max` bounds the output accepted across both sinks, because the target picks
+/// how much there is and a capture sink keeps every byte of it in the
+/// controller's memory; a terminal sink keeps nothing and passes `u64::MAX`. The
+/// first frame that would cross the ceiling is dropped unwritten and the stream
+/// with it. A frame is read whole before it is charged, so the peak is `max`
+/// plus one `MAX_MSG`.
+pub async fn recv_exec_output<R, O, E>(
+    r: &mut R,
+    out: &mut O,
+    err: &mut E,
+    max: u64,
+) -> Result<i32>
+where
+    R: AsyncRead + Unpin,
+    O: AsyncWrite + Unpin,
+    E: AsyncWrite + Unpin,
+{
+    let mut code = None;
+    let mut truncated = false;
+    let mut got = 0u64;
+    while let Some(frame) = read_msg_opt::<_, ExecFrame>(r).await? {
+        if let ExecFrame::Stdout(b) | ExecFrame::Stderr(b) = &frame {
+            got += b.len() as u64;
+            ensure!(
+                got <= max,
+                "target sent more than the {max}-byte exec output ceiling"
+            );
+        }
+        match frame {
+            ExecFrame::Stdout(b) => out.write_all(&b).await?,
+            ExecFrame::Stderr(b) => err.write_all(&b).await?,
+            ExecFrame::Exit(c) => code = Some(c),
+            ExecFrame::Failed(e) => bail!("exec failed on the target: {e}"),
+            ExecFrame::Truncated => truncated = true,
+        }
+    }
+    out.flush().await?;
+    err.flush().await?;
+    // Said out loud, because the exit status is about the command and says
+    // nothing about whether its output arrived whole. Hedged, because the usual
+    // cause is a daemon the command left holding the pipes, in which case the
+    // output above is complete and only the agent's certainty is missing.
+    if truncated {
+        tracing::warn!(
+            "the target stopped reading this command's output before end of file \
+             (usually a daemon it started still holds the pipes); the output above \
+             may be incomplete"
+        );
+    }
+    code.context("agent closed the stream without reporting an exit status")
+}
+
 /// Streams the rest of `r` into `dest`, verifying length and digest before the
 /// destination path is allowed to exist: a truncated or corrupted transfer
 /// leaves the target untouched rather than half-written.
@@ -577,5 +631,57 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("expected 6 bytes"), "{err}");
         assert!(!dest.exists());
+    }
+
+    #[tokio::test]
+    async fn exec_output_past_the_ceiling_is_cut_and_reported() {
+        let (mut w, mut r) = tokio::io::duplex(4096);
+        let sender = tokio::spawn(async move {
+            let mut frames = 0usize;
+            while frames < 1024 {
+                let frame = if frames % 2 == 0 {
+                    ExecFrame::Stdout(vec![b'o'; 1024])
+                } else {
+                    ExecFrame::Stderr(vec![b'e'; 1024])
+                };
+                if write_msg(&mut w, &frame).await.is_err() {
+                    break;
+                }
+                frames += 1;
+            }
+            frames
+        });
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let e = recv_exec_output(&mut r, &mut out, &mut err, 4096)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("ceiling"), "{e}");
+        assert!(
+            out.len() + err.len() <= 4096,
+            "buffered past the ceiling: {} + {}",
+            out.len(),
+            err.len()
+        );
+        drop(r);
+        let frames = sender.await.unwrap();
+        assert!(frames < 64, "the receiver kept reading: {frames} frames");
+    }
+
+    #[tokio::test]
+    async fn exec_output_under_the_ceiling_arrives_whole_with_its_status() {
+        let (mut w, mut r) = tokio::io::duplex(64);
+        let sender = tokio::spawn(async move {
+            write_msg(&mut w, &ExecFrame::Stdout(b"to-stdout\n".to_vec())).await.unwrap();
+            write_msg(&mut w, &ExecFrame::Stderr(b"to-stderr\n".to_vec())).await.unwrap();
+            write_msg(&mut w, &ExecFrame::Stdout(b"more\n".to_vec())).await.unwrap();
+            write_msg(&mut w, &ExecFrame::Exit(3)).await.unwrap();
+            finish(&mut w).await.unwrap();
+        });
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = recv_exec_output(&mut r, &mut out, &mut err, 25).await.unwrap();
+        sender.await.unwrap();
+        assert_eq!(code, 3);
+        assert_eq!(out, b"to-stdout\nmore\n");
+        assert_eq!(err, b"to-stderr\n");
     }
 }

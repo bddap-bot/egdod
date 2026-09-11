@@ -24,10 +24,10 @@ skipped. `EGDOD_DEMO_OFFLINE=1` skips 15-17 and prints what that costs.
 
 ## PROVED
 
-### `cargo test` — 21 tests, green
+### `cargo test` — 23 tests, green
 
 ```
-running 20 tests
+running 22 tests
 test net::tests::relay_addr_is_never_reported_as_direct ... ok
 test net::tests::path_classification ... ok
 test net::tests::relay_choice_flags ... ok
@@ -37,6 +37,8 @@ test proto::tests::declared_over_the_ceiling_is_refused_unwritten ... ok
 test proto::tests::msg_roundtrip_and_framing ... ok
 test proto::tests::free_space_is_checked_before_anything_is_created ... ok
 test proto::tests::lying_stream_is_cut_at_the_announced_length ... ok
+test proto::tests::exec_output_past_the_ceiling_is_cut_and_reported ... ok
+test proto::tests::exec_output_under_the_ceiling_arrives_whole_with_its_status ... ok
 test agent::tests::agent_key_is_stable_across_runs ... ok
 test ssh::tests::civil_dates_match_the_calendar ... ok
 test ssh::tests::line_carries_options_and_utc_expiry ... ok
@@ -49,7 +51,7 @@ test state::tests::approval_is_by_pubkey_and_survives_restart ... ok
 test proto::tests::copy_verifies_digest_and_preserves_mode ... ok
 test net::tests::probe_of_a_nonexistent_endpoint_fails ... ok
 
-test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.04s
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.07s
 
      Running tests/integration.rs
 running 1 test
@@ -211,6 +213,31 @@ Watched, in the `cargo test` run above:
 - `tests/integration.rs` — the 5 MiB round-trip file pulled again over the
   real iroh session under a 1 MiB ceiling: refused on the declaration, no
   destination, no staging file in the directory.
+
+`exec` is the other door: `exec_capture` keeps a command's whole output in
+memory, and the ssh recipe captures two commands (host key generation, the
+sshd start). `recv_exec_output` — the one receiver for exec frames, behind the
+terminal command and the capture alike — takes a ceiling on the bytes accepted
+across stdout and stderr: the first frame that would cross it is dropped
+unwritten and the stream with it, reported as an error rather than a shorter
+result. The terminal command passes `u64::MAX`, since it holds nothing; the
+recipe's two captures pass 64 KiB, enough for the few lines either command
+reports and small enough to matter on a handset.
+
+Watched, in the same run:
+
+- `exec_output_past_the_ceiling_is_cut_and_reported` — 1 KiB frames
+  alternating stdout and stderr, streamed without end under a 4 KiB ceiling:
+  the receiver returns the ceiling error holding at most 4 KiB across both
+  sinks, and the sender gets fewer than 64 frames through before its writes
+  fail. Remove the ceiling check and the receiver drains all 1024 frames and
+  fails only for the missing exit status; count stdout alone and it holds
+  8 KiB; drop frames past the ceiling instead of failing and the error never
+  comes.
+- `exec_output_under_the_ceiling_arrives_whole_with_its_status` — 25 bytes
+  over three frames on both sinks under a ceiling of exactly 25: both buffers
+  arrive whole and the exit status is 3. Make the check strict and it fails
+  on the last frame.
 
 Each test was falsified against its own mutation in a scratch checkout, named
 in the landing commit: removing the guarded line turns the test red for the
