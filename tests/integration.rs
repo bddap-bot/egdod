@@ -166,6 +166,7 @@ async fn end_to_end() {
         ],
         &mut out,
         &mut err,
+        u64::MAX,
     )
     .await
     .unwrap();
