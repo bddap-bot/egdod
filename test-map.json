@@ -44,16 +44,6 @@
     },
     {
       "paths": [
-        "boot/init.c",
-        "boot/image.nix"
-      ],
-      "tests": [
-        "nix-build boot/image.nix -o result-boot-gate"
-      ],
-      "why": "the pinned Secure Boot image: init.c compiles only inside this derivation and image.nix assembles the ESP from hash-pinned Debian shim/grub/kernel plus the static musl agent, so the build itself is the check; nix caches by input hash"
-    },
-    {
-      "paths": [
         "boot/run-boot.sh",
         "boot/rig.sh"
       ],

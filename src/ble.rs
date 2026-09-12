@@ -114,8 +114,11 @@ fn decrypt(key: &[u8; 32], n: u8, aad: &[u8], cipher: &[u8]) -> Result<Vec<u8>> 
 }
 
 fn network_conf(ssid: &str, psk: &str) -> Result<String> {
-    if ssid.is_empty() || ssid.len() > 32 || ssid.contains(['\n', '\r', '\0']) {
-        bail!("SSID must be 1–32 bytes without a line break or NUL");
+    if ssid.is_empty()
+        || ssid.len() > 32
+        || ssid.contains(['\n', '\r', '\0', '"', '\\'])
+    {
+        bail!("SSID must be 1–32 bytes without a quote, backslash, line break or NUL");
     }
     let raw = psk.len() == 64 && psk.bytes().all(|b| b.is_ascii_hexdigit());
     let psk_ok = (8..=63).contains(&psk.len()) || raw;
@@ -583,9 +586,7 @@ mod tests {
         assert!(network_conf("lab", &"ab".repeat(32))
             .unwrap()
             .contains("psk=abab"));
-        assert!(network_conf("lab\\\"", "tab\tpass")
-            .unwrap()
-            .contains("ssid=6c61625c22"));
+        assert!(network_conf("lab\\\"", "tab\tpass").is_err());
         assert!(network_conf("lab", "quote\"pass").is_err());
         assert!(network_conf("lab", "slash\\pass").is_err());
     }
