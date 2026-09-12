@@ -109,7 +109,7 @@ let
     buildPhase = ''
     set -euo pipefail
     x86_64-unknown-linux-musl-gcc -static -O2 -o init ${./init.c}
-    mkdir -p rootfs/bin rootfs/nix/store rootfs/etc/dbus-1/system.d
+    mkdir -p rootfs/bin rootfs/nix/store rootfs/etc/dbus-1
     cp init rootfs/init
     cp ${agent}/bin/egdod rootfs/egdod
     cp ${pkgs.pkgsStatic.busybox}/bin/busybox rootfs/bin/busybox
@@ -118,8 +118,7 @@ let
     while read -r path; do cp -a "$path" rootfs/nix/store/; done < ${bluetoothClosure}/store-paths
     ln -s ${pkgs.bluez}/bin/bluetoothd rootfs/bin/bluetoothd
     ln -s ${pkgs.dbus}/bin/dbus-daemon rootfs/bin/dbus-daemon
-    sed 's#<user>messagebus</user>#<user>root</user>#' ${pkgs.dbus}/share/dbus-1/system.conf > rootfs/etc/dbus-1/system.conf
-    cp ${pkgs.bluez}/share/dbus-1/system.d/bluetooth.conf rootfs/etc/dbus-1/system.d/bluetooth.conf
+    cp ${./dbus-system.conf} rootfs/etc/dbus-1/system.conf
     cp ${./udhcpc.script} rootfs/bin/udhcpc.script
     chmod +x rootfs/bin/udhcpc.script
     cp -r ${drivers}/lib rootfs/lib

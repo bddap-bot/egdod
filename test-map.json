@@ -16,7 +16,8 @@
         "src/main.rs",
         "src/lib.rs",
         "boot/init.c",
-        "boot/image.nix",
+      "boot/image.nix",
+      "boot/dbus-system.conf",
         "Cargo.toml",
         "Cargo.lock"
       ],
