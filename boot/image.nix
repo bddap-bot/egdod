@@ -33,7 +33,7 @@ let
             else "";
   netArg = if dhcp then " egdod.dhcp"
            else " egdod.ip=${ip} egdod.gw=${gw} egdod.mask=${mask}";
-  cmdline = "console=ttyS0,115200 egdod.controller=${controllerNodeId}"
+  cmdline = "console=tty0 console=ttyS0,115200 egdod.controller=${controllerNodeId}"
     + netArg + " egdod.mods=/e1000.ko,/efivarfs.ko" + dialArg;
 in
 pkgs.stdenv.mkDerivation {
