@@ -2,6 +2,7 @@
 //! three powers over it — exec, copy, forward. See `SPEC.md`.
 
 pub mod agent;
+pub mod ble;
 pub mod controller;
 pub mod link;
 pub mod net;

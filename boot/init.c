@@ -186,7 +186,7 @@ static void default_route(const char *dev, const char *gw) {
     close(fd);
 }
 
-enum kind { NONE, WIRED, STATION, AP };
+enum kind { NONE, WIRED, STATION, AP, BLE };
 
 struct link {
     enum kind kind;
@@ -194,6 +194,8 @@ struct link {
     char dial[64];
     pid_t daemon;
     pid_t dhcp;
+    pid_t dbus;
+    pid_t bluetoothd;
     struct stat networks;
 };
 
@@ -340,6 +342,45 @@ static int access_point(void) {
     return 1;
 }
 
+static int bluetooth(void) {
+    const char *id = arg("egdod.controller");
+    if (!id || access("/bin/bluetoothd", X_OK) || access("/bin/dbus-daemon", X_OK)) return 0;
+    up.dev[0] = 0;
+    mkdir("/run", 0755);
+    mkdir("/run/dbus", 0755);
+    mkdir("/var", 0755);
+    mkdir("/var/lib", 0755);
+    mkdir("/var/lib/bluetooth", 0700);
+    char uuid[64];
+    if (read_file("/proc/sys/kernel/random/uuid", uuid, sizeof uuid) > 0) {
+        char machine[33];
+        int n = 0;
+        for (int i = 0; uuid[i] && n < 32; i++) if (uuid[i] != '-') machine[n++] = uuid[i];
+        machine[n] = 0;
+        int fd = open("/etc/machine-id", O_WRONLY | O_CREAT | O_TRUNC, 0444);
+        if (fd >= 0) { write(fd, machine, n); close(fd); }
+    }
+    char *dav[] = { "/bin/dbus-daemon", "--config-file=/etc/dbus-1/system.conf", "--nofork", NULL };
+    up.dbus = spawn(dav);
+    sleep(1);
+    char *bav[] = { "/bin/bluetoothd", "--nodetach", "--experimental", NULL };
+    up.bluetoothd = spawn(bav);
+    sleep(1);
+    char *idw = dup_word(id);
+    char *av[] = { "/egdod", "ble", "--controller", idw, "--key-file", "/agent.key", "--output", NETWORKS, NULL };
+    up.daemon = spawn(av);
+    sleep(2);
+    if (waitpid(up.daemon, NULL, WNOHANG) == up.daemon) {
+        up.daemon = -1;
+        stop(&up.bluetoothd);
+        stop(&up.dbus);
+        return 0;
+    }
+    if (stat(NETWORKS, &up.networks)) memset(&up.networks, 0, sizeof up.networks);
+    printf("init: link BLE first hop; waiting for network credentials\n");
+    return 1;
+}
+
 static int networks_changed(void) {
     struct stat st;
     if (stat(NETWORKS, &st)) return 0;
@@ -349,10 +390,12 @@ static int networks_changed(void) {
 
 static void bring_down(void) {
     stop(&up.daemon);
+    stop(&up.bluetoothd);
+    stop(&up.dbus);
     if (up.dhcp > 0) { kill(up.dhcp, SIGTERM); up.dhcp = -1; }
     if (up.dev[0]) set_addr(up.dev, "0.0.0.0", NULL);
     memset(&up, 0, sizeof up);
-    up.daemon = up.dhcp = -1;
+    up.daemon = up.dhcp = up.dbus = up.bluetoothd = -1;
 }
 
 static void bring_up(void) {
@@ -375,6 +418,10 @@ static void bring_up(void) {
     }
     if (access_point()) {
         up.kind = AP;
+        return;
+    }
+    if (bluetooth()) {
+        up.kind = BLE;
         return;
     }
     printf("init: no link%s\n", wireless[0] ? "" : " and no wireless device");
@@ -451,7 +498,7 @@ static void relink(pid_t *agent, char ***av) {
     if (*agent > 0) { kill(*agent, SIGKILL); waitpid(*agent, NULL, 0); }
     bring_up();
     *av = agent_argv();
-    *agent = spawn(*av);
+    *agent = up.kind == BLE ? -1 : spawn(*av);
     fflush(stdout);
 }
 
@@ -481,20 +528,21 @@ int main(void) {
     mount("efivarfs", "/sys/firmware/efi/efivars", "efivarfs", 0, NULL);
 
     iface_up("lo");
-    up.daemon = up.dhcp = -1;
+    up.daemon = up.dhcp = up.dbus = up.bluetoothd = -1;
     bring_up();
 
-    printf("init: egdod PID 1 up, launching agent\n");
+    printf("init: egdod PID 1 up%s\n", up.kind == BLE ? "; provisioning before the IP agent starts" : ", launching agent");
     fflush(stdout);
 
     char **av = agent_argv();
-    pid_t agent = spawn(av);
+    pid_t agent = up.kind == BLE ? -1 : spawn(av);
     time_t retry_at = time(NULL) + RETRY_WAIT;
     for (;;) {
         int st;
         pid_t w;
         int lost_link = 0;
-        if (agent <= 0) agent = spawn(av);
+        int provisioned = 0;
+        if (agent <= 0 && up.kind != BLE) agent = spawn(av);
         while ((w = waitpid(-1, &st, WNOHANG)) > 0) {
             if (w == agent) {
                 printf("init: agent exited; relaunching\n");
@@ -502,18 +550,24 @@ int main(void) {
                 agent = spawn(av);
             } else if (w == up.daemon) {
                 up.daemon = -1;
-                lost_link = 1;
+                if (up.kind == BLE && WIFEXITED(st) && WEXITSTATUS(st) == 0) provisioned = 1;
+                else lost_link = 1;
             } else if (w == up.dhcp) {
                 up.dhcp = -1;
+            } else if (w == up.bluetoothd || w == up.dbus) {
+                lost_link = 1;
             }
         }
         if (access("/switch.req", F_OK) == 0) {
             switch_root(&agent, av);
+        } else if ((up.kind == AP || up.kind == BLE) && networks_changed()) {
+            printf("init: network credentials received over %s\n", up.kind == BLE ? "BLE" : "the access point");
+            relink(&agent, &av);
+        } else if (provisioned) {
+            printf("init: BLE provisioning complete\n");
+            relink(&agent, &av);
         } else if (lost_link) {
             printf("init: link daemon exited; bringing the link up again\n");
-            relink(&agent, &av);
-        } else if (up.kind == AP && networks_changed()) {
-            printf("init: network credentials received over the access point\n");
             relink(&agent, &av);
         } else if ((up.kind == NONE || (up.dev[0] && !carrier(up.dev))) && time(NULL) >= retry_at) {
             printf("init: %s; bringing the link up again\n", up.kind == NONE ? "no link" : "carrier lost");

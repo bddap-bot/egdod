@@ -1,17 +1,21 @@
 use anyhow::{Context, Result};
-use std::io::IsTerminal;
 use clap::{Args, Parser, Subcommand};
 use egdod::controller::{self, ServeConfig};
 use egdod::net::RelayChoice;
 use egdod::proto::parse_pubkey;
 use egdod::state::StateDir;
-use egdod::{agent, link, ssh};
+use egdod::{agent, ble, link, ssh};
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "egdod", version, about = "Dial-out root access to a bare machine over iroh")]
+#[command(
+    name = "egdod",
+    version,
+    about = "Dial-out root access to a bare machine over iroh"
+)]
 struct Cli {
     #[command(subcommand)]
     role: Role,
@@ -42,6 +46,15 @@ enum Role {
         /// Print the wpa_supplicant.conf a controller joins with instead.
         #[arg(long, conflicts_with = "json")]
         supplicant: bool,
+    },
+    #[command(hide = true)]
+    Ble {
+        #[arg(long)]
+        controller: String,
+        #[arg(long, default_value = "/agent.key")]
+        key_file: PathBuf,
+        #[arg(long, default_value = "/wpa_supplicant.conf")]
+        output: PathBuf,
     },
 }
 
@@ -103,6 +116,11 @@ enum ControllerCmd {
         iface: Option<String>,
         #[arg(long, conflicts_with = "iface")]
         json: bool,
+    },
+    Ble {
+        agent: String,
+        #[arg(long, num_args = 2, value_names = ["SSID", "PSK"])]
+        network: Vec<String>,
     },
     /// The controller's own view of itself, including whether it is dialable.
     Status {
@@ -199,7 +217,12 @@ async fn main() -> Result<()> {
             let state = StateDir::new(state_dir.unwrap_or_else(StateDir::default_path));
             run_controller(state, cmd).await
         }
-        Role::Link { node_id, json, hostapd, supplicant } => {
+        Role::Link {
+            node_id,
+            json,
+            hostapd,
+            supplicant,
+        } => {
             let id = parse_pubkey(&node_id).context("node id")?;
             let what = match (json, hostapd, supplicant) {
                 (_, Some(iface), _) => link::Show::Hostapd(iface),
@@ -208,6 +231,14 @@ async fn main() -> Result<()> {
                 (false, None, false) => link::Show::Lines,
             };
             link::show(&id, what)
+        }
+        Role::Ble {
+            controller,
+            key_file,
+            output,
+        } => {
+            let controller = parse_pubkey(&controller).context("--controller")?;
+            ble::serve(controller, &key_file, &output).await
         }
     }
 }
@@ -235,10 +266,26 @@ async fn run_controller(state: StateDir, cmd: ControllerCmd) -> Result<()> {
         }
         ControllerCmd::Pending { json } => controller::pending(&state, json),
         ControllerCmd::Approve { pubkey } => controller::approve(&state, &pubkey),
-        ControllerCmd::Join { iface: Some(iface), .. } => link::join(&state, &iface).await,
+        ControllerCmd::Join {
+            iface: Some(iface), ..
+        } => link::join(&state, &iface).await,
         ControllerCmd::Join { iface: None, json } => {
             let id = state.load_key()?.public();
-            link::show(&id, if json { link::Show::Json } else { link::Show::Lines })
+            link::show(
+                &id,
+                if json {
+                    link::Show::Json
+                } else {
+                    link::Show::Lines
+                },
+            )
+        }
+        ControllerCmd::Ble { agent, network } => {
+            let agent = parse_pubkey(&agent).context("agent node id")?;
+            let [ssid, psk]: [String; 2] = network
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("--network requires SSID and PSK"))?;
+            ble::provision(state.load_key()?, agent, ssid, psk).await
         }
         ControllerCmd::Status { json } => std::process::exit(controller::status(&state, json)?),
         ControllerCmd::Exec { agent, argv } => {

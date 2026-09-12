@@ -12,6 +12,25 @@
     },
     {
       "paths": [
+        "src/ble.rs",
+        "src/main.rs",
+        "src/lib.rs",
+        "boot/init.c",
+        "boot/image.nix",
+        "Cargo.toml",
+        "Cargo.lock"
+      ],
+      "tests": [
+        "nix-shell --run 'cargo test --manifest-path vendor/noq-udp/Cargo.toml --lib'",
+        "nix-shell --run 'cargo test'",
+        "nix-build musl.nix -o result-gate",
+        "nix-build default.nix -o result-host-gate",
+        "nix-build boot/image.nix -o result-boot-gate"
+      ],
+      "why": "the authenticated BLE credential hop spans the existing binary, its static initramfs build and the BlueZ closure in the boot image; all three artifacts must build and the protocol plus existing UDP patch must remain green"
+    },
+    {
+      "paths": [
         "nixpkgs.nix"
       ],
       "tests": [

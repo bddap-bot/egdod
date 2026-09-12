@@ -54,6 +54,7 @@ let
   ];
 
   krel = "6.12.96+deb13-amd64";
+  bluetoothClosure = pkgs.closureInfo { rootPaths = [ pkgs.bluez pkgs.dbus ]; };
   dialArg = if direct != "" then " egdod.direct=${direct} egdod.norelay"
             else if relay != "" then " egdod.relay=${relay}"
             else "";
@@ -108,18 +109,23 @@ let
     buildPhase = ''
     set -euo pipefail
     x86_64-unknown-linux-musl-gcc -static -O2 -o init ${./init.c}
-    mkdir -p rootfs/bin
+    mkdir -p rootfs/bin rootfs/nix/store rootfs/etc/dbus-1/system.d
     cp init rootfs/init
     cp ${agent}/bin/egdod rootfs/egdod
     cp ${pkgs.pkgsStatic.busybox}/bin/busybox rootfs/bin/busybox
     cp ${pkgs.pkgsStatic.wpa_supplicant}/bin/wpa_supplicant rootfs/bin/wpa_supplicant
     cp ${pkgs.pkgsStatic.hostapd}/bin/hostapd rootfs/bin/hostapd
+    while read -r path; do cp -a "$path" rootfs/nix/store/; done < ${bluetoothClosure}/store-paths
+    ln -s ${pkgs.bluez}/bin/bluetoothd rootfs/bin/bluetoothd
+    ln -s ${pkgs.dbus}/bin/dbus-daemon rootfs/bin/dbus-daemon
+    sed 's#<user>messagebus</user>#<user>root</user>#' ${pkgs.dbus}/share/dbus-1/system.conf > rootfs/etc/dbus-1/system.conf
+    cp ${pkgs.bluez}/share/dbus-1/system.d/bluetooth.conf rootfs/etc/dbus-1/system.d/bluetooth.conf
     cp ${./udhcpc.script} rootfs/bin/udhcpc.script
     chmod +x rootfs/bin/udhcpc.script
     cp -r ${drivers}/lib rootfs/lib
     ( cd rootfs && find . -print0 | cpio --null -H newc -o 2>/dev/null | gzip -1 ) > initrd.img
     cat ${drivers}/sizes.txt > sizes.txt
-    du -sh rootfs/bin initrd.img >> sizes.txt
+    du -sh rootfs/bin rootfs/nix/store initrd.img >> sizes.txt
     '';
     installPhase = ''
     mkdir -p $out
