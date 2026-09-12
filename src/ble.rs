@@ -144,16 +144,22 @@ fn install(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut name = path.as_os_str().to_os_string();
     name.push(format!(".ble.tmp.{}", std::process::id()));
     let tmp = std::path::PathBuf::from(name);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)
-        .with_context(|| format!("creating {}", tmp.display()))?;
-    file.write_all(bytes).context("writing BLE credentials")?;
-    file.sync_all().context("flushing BLE credentials")?;
-    drop(file);
-    std::fs::rename(&tmp, path).with_context(|| format!("installing {}", path.display()))
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        file.write_all(bytes).context("writing BLE credentials")?;
+        file.sync_all().context("flushing BLE credentials")?;
+        drop(file);
+        std::fs::rename(&tmp, path).with_context(|| format!("installing {}", path.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 async fn write_frame(writer: &mut CharacteristicWriter, bytes: &[u8]) -> Result<()> {
@@ -327,7 +333,9 @@ async fn serve_on_adapter(
             }
             install(output, &conf)?;
             let ack = crypt(&session_key, 1, &transcript, b"ok")?;
-            write_frame(&mut writer, &ack).await?;
+            if let Err(error) = write_frame(&mut writer, &ack).await {
+                eprintln!("egdod: credentials installed but BLE acknowledgement failed: {error:#}");
+            }
             tokio::time::sleep(Duration::from_secs(1)).await;
             Ok::<(), anyhow::Error>(())
         })
@@ -397,8 +405,8 @@ pub async fn provision(
             let characteristic = characteristic(&device).await?;
             let mut notify = characteristic.notify_io().await?;
             let mut write = characteristic.write_io().await?;
-            let hello = read_frame(&mut notify).await?;
-            let hello = parse_server_hello(&hello)?;
+            let hello_bytes = read_frame(&mut notify).await?;
+            let hello = parse_server_hello(&hello_bytes)?;
             if hello.agent != expected_agent {
                 bail!("BLE target node id does not match the requested agent");
             }
@@ -423,7 +431,7 @@ pub async fn provision(
             request.extend_from_slice(controller.as_bytes());
             request.extend_from_slice(&client_ephemeral);
             request.extend_from_slice(&signature.to_bytes());
-            let mut transcript = server_hello_bytes(&hello);
+            let mut transcript = hello_bytes;
             transcript.extend_from_slice(&request);
             let shared = secret.diffie_hellman(&XPublicKey::from(hello.ephemeral)).to_bytes();
             let session_key = session_key(shared, &transcript);
@@ -450,14 +458,6 @@ pub async fn provision(
         let _ = adapter.set_powered(false).await;
     }
     result
-}
-
-fn server_hello_bytes(hello: &ServerHello) -> Vec<u8> {
-    let mut out = Vec::with_capacity(128);
-    out.extend_from_slice(hello.agent.as_bytes());
-    out.extend_from_slice(&hello.ephemeral);
-    out.extend_from_slice(&hello.signature.to_bytes());
-    out
 }
 
 #[cfg(test)]

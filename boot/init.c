@@ -570,8 +570,7 @@ int main(void) {
         } else if (lost_link) {
             printf("init: link daemon exited; bringing the link up again\n");
             relink(&agent, &av);
-        } else if ((up.kind == NONE || (up.kind == BLE && !networks_changed())
-                    || (up.dev[0] && !carrier(up.dev))) && time(NULL) >= retry_at) {
+        } else if ((up.kind == NONE || (up.dev[0] && !carrier(up.dev))) && time(NULL) >= retry_at) {
             printf("init: %s; bringing the link up again\n", up.kind == NONE ? "no link" : "carrier lost");
             relink(&agent, &av);
             retry_at = time(NULL) + RETRY_WAIT;
