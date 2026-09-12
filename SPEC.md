@@ -69,7 +69,8 @@ egdod controller exec <agent> -- <argv...>
 egdod controller push <agent> <local-path> <remote-path>
 egdod controller pull <agent> <remote-path> <local-path>
 egdod controller forward <agent> <local-port> <remote-addr:port>
-| --hostapd <dev> | --supplicant]
+egdod controller join [--iface <dev>]           # join the access point a target hosts for this key
+egdod link <nodeid> [--json | --hostapd <dev> | --supplicant]
 egdod agent --controller <nodeid> [--relay <url> | --no-relay] [--direct <addr:port>]
 ```
 
@@ -100,7 +101,7 @@ to drop a driver, a firmware blob, or a module tree; `PROOF.md` records what the
 fact, not as a cost to reduce. `egdod.mods=` on the command line names only what a modalias cannot
 express (`efivarfs`).
 
-## Getting onto a network: wired, baked station
+## Getting onto a network: wired, baked station, derived access point
 
 v0 assumed a cable. The stick now brings one link up, in this order, with one code path
 (`boot/init.c`), and dials exactly the same way over whichever it gets:
@@ -113,7 +114,41 @@ v0 assumed a cable. The stick now brings one link up, in this order, with one co
    first baked network in range (30 s bound), takes DHCP, and dials as over Ethernet. The
    credentials sit on the stick in plaintext, the same trade an installer stick with a preseed makes.
 3. **Derived access point.** With no wired carrier and no baked network in range, the target hosts
-   an access point itself and the controller comes to it: the next increment.
+   an access point itself and the controller comes to it. Everything about that link is a function
+   of the controller node id the image already carries, so both ends compute it and nothing is
+   typed:
+
+   ```
+   h(label) = SHA-256(label ‖ node id as 32 raw bytes)
+   SSID       = "egdod-" ‖ hex(h("egdod-link-ssid")[0..4])
+   PSK        = h("egdod-link-psk")            (raw 256-bit WPA2 PSK, 64 hex; hostapd wpa_psk=)
+   a          = h("egdod-link-addr")
+   target     = 169.254.(1 + a[0] mod 254).(1 + a[1] mod 254)
+   controller = 169.254.(same third octet).(1 + a[2] mod 254), bumped once if it collides
+   port       = 49152 + (a[3] ‖ a[4] as big-endian u16) mod 16384
+   prefix     = /16
+   ```
+
+   `egdod link <node-id>` prints all of it (`--json`, `--hostapd IFACE`, `--supplicant`);
+   `egdod controller join --iface DEV` joins the access point for the controller's own key and
+   holds it while `serve` runs bound to that port. The agent on the target dials
+   `controller:port` directly, so the direction of the protocol is unchanged: the agent dials, the
+   controller listens, approval is by public key exactly as on any other link. The PSK grants a
+   link and nothing else — anyone with the public node id can compute it, which puts them where
+   anyone on the target's LAN already is. The same holds in the other direction: anyone can host
+   an access point with the derived name and key, and a controller that `join`s it has handed
+   that stranger a link to itself and nothing more — the controller serves only agents it has
+   approved, and `join` is a deliberate act on a network the operator chose to stand next to.
+
+   The first thing worth doing over that link is handing the target a real network: `push` a
+   `wpa_supplicant.conf` to `/wpa_supplicant.conf` on the target. `init` sees the file land, tears
+   the access point down, joins as a station, takes DHCP, and relaunches the agent with the
+   image's normal dial settings; the approved key survives, so the session resumes without a
+   second approval.
+
+   Vector, for an independent controller to check itself against: node id
+   `ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c` gives SSID `egdod-dd18e097`,
+   target `169.254.200.131`, controller `169.254.200.129`, port `58263`.
 
 Wireless needs the vendor firmware the kernel would otherwise fetch from a distro: the image carries
 Debian's non-free set for Intel, Atheros, Realtek, Broadcom, MediaTek and Marvell Libertas radios
