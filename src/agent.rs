@@ -82,25 +82,26 @@ pub async fn run(cfg: Config) -> Result<()> {
     // stdout, not a log line: on a bare target this print is how the operator
     // learns which key to approve, e.g. from a serial console capture.
     println!("agent pubkey: {}", secret.public());
+    console(&format!("agent pubkey: {}", secret.public()));
 
     let mut backoff = SHORT_RETRY;
     loop {
         let delay = match session(&secret, &cfg).await {
             Ok(Outcome::Pending) => {
-                tracing::warn!(
-                    pubkey = %secret.public(),
-                    "controller has not approved this agent yet; retrying"
-                );
+                report(format!(
+                    "controller has not approved {} yet; retrying",
+                    secret.public()
+                ));
                 backoff = SHORT_RETRY;
                 PENDING_RETRY
             }
             Ok(Outcome::Ended) => {
-                tracing::info!("controller connection ended; redialing");
+                report("controller connection ended; redialing".into());
                 backoff = SHORT_RETRY;
                 SHORT_RETRY
             }
             Err(e) => {
-                tracing::warn!("dial failed: {e:#}");
+                report(format!("dial failed: {e:#}"));
                 let d = backoff;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
                 d
@@ -108,6 +109,27 @@ pub async fn run(cfg: Config) -> Result<()> {
         };
         tokio::time::sleep(delay).await;
     }
+}
+
+fn console(line: &str) {
+    use std::io::Write;
+    let stdout_dev = rustix::fs::fstat(std::io::stdout()).ok().map(|s| s.st_rdev);
+    for dev in ["/dev/console", "/dev/tty0"] {
+        let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(dev) else {
+            continue;
+        };
+        if rustix::fs::fstat(&f).ok().map(|s| s.st_rdev) == stdout_dev {
+            continue;
+        }
+        let _ = writeln!(f, "egdod: {line}");
+    }
+}
+
+/// The log is stderr; a target with nobody logged in shows its screen and
+/// serial console, so every dial state change goes there too.
+fn report(line: String) {
+    tracing::info!("{line}");
+    console(&line);
 }
 
 async fn session(secret: &SecretKey, cfg: &Config) -> Result<Outcome> {
@@ -131,7 +153,7 @@ async fn session(secret: &SecretKey, cfg: &Config) -> Result<Outcome> {
         Ok(Err(e)) => Err(anyhow::Error::new(e).context("dialling controller")),
         Ok(Ok(conn)) => {
             let (path, remote) = net::session_path_report(&conn);
-            tracing::info!(%path, %remote, "connected to controller");
+            report(format!("connected to controller via {path} ({remote})"));
             Ok(serve_connection(conn).await)
         }
     };
@@ -147,7 +169,7 @@ async fn serve_connection(conn: Connection) -> Outcome {
     let mut changes = net::path_changes(conn.clone());
     tokio::spawn(async move {
         while let Some((was, now, remote)) = changes.recv().await {
-            tracing::info!(%was, %now, %remote, "path changed");
+            report(format!("path changed: {was} -> {now} ({remote})"));
         }
     });
     loop {
