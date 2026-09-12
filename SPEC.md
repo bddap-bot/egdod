@@ -70,6 +70,7 @@ egdod controller push <agent> <local-path> <remote-path>
 egdod controller pull <agent> <remote-path> <local-path>
 egdod controller forward <agent> <local-port> <remote-addr:port>
 egdod controller join [--iface <dev>]           # join the access point a target hosts for this key
+egdod controller ble <agent> --network <ssid> <psk>
 egdod link <nodeid> [--json | --hostapd <dev> | --supplicant]
 egdod agent --controller <nodeid> [--relay <url> | --no-relay] [--direct <addr:port>]
 ```
@@ -101,7 +102,7 @@ to drop a driver, a firmware blob, or a module tree; `PROOF.md` records what the
 fact, not as a cost to reduce. `egdod.mods=` on the command line names only what a modalias cannot
 express (`efivarfs`).
 
-## Getting onto a network: wired, baked station, derived access point
+## Getting onto a network: wired, baked station, derived access point, BLE
 
 v0 assumed a cable. The stick now brings one link up, in this order, with one code path
 (`boot/init.c`), and dials exactly the same way over whichever it gets:
@@ -157,10 +158,36 @@ their dependencies, and loads drivers by modalias at boot. A USB Ethernet or wir
 driver and firmware are in that set is the zero-code fallback for a machine whose built-in radio is
 not.
 
+### BLE is only the first hop
+
+Bluetooth Low Energy is the last link fallback, after wired carrier, a baked station network and the
+derived access point. It carries the target and controller node ids and one
+`wpa_supplicant.conf`; it never carries an egdod session. Once the file arrives, the same init loop
+stops Bluetooth, joins that network through the existing station path, takes DHCP and launches the
+same IP dial as every other link.
+
+The target advertises the fixed egdod GATT service with local name `egdod-` followed by the first
+eight hexadecimal digits of its node id. `egdod controller ble <agent-node-id> --network SSID PSK`
+scans for that service, connects only to the requested node id and proves both identities before it
+sends credentials. Each side signs the protocol label, both node ids and its ephemeral X25519 key
+with its iroh Ed25519 identity; the target accepts only the controller id baked into the image, and
+the controller accepts only the agent id named on its command line. The shared X25519 secret and
+the signed transcript derive a ChaCha20-Poly1305 key, so the network credentials are neither clear
+text nor writable by a radio that lacks the controller key. Payloads are bounded at 64 KiB and a
+credential file is installed atomically at mode 0600.
+
+BlueZ supplies the radio and GATT implementation on both ends. The initramfs carries `bluetoothd`,
+the D-Bus daemon it uses and their pinned closures; the existing binary supplies the GATT target and
+controller subcommands. Those processes exist only while provisioning. The session agent remains
+the same static executable and has no Bluetooth, D-Bus or second lifecycle: possessing the BLE link
+grants no command, file or tunnel access, and approval by the agent's public key still gates all
+three primitives after the ordinary IP dial.
+
 ## Explicit non-goals for v0
 
-No OS installer, no disko or partitioning, no BLE, no web UI. Image building, Secure Boot and the
-target-hosted access point were later increments and are now in (see above and `boot/`).
+No OS installer, no disko or partitioning, no web UI. Image building, Secure Boot, the
+target-hosted access point and BLE credential bootstrap were later increments and are now in (see
+above and `boot/`).
 No Android packaging either — property 6 constrains the design, it is not a v0 deliverable.
 
 ## Deliverables
