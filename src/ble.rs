@@ -1,0 +1,488 @@
+use anyhow::{bail, Context, Result};
+use bluer::{
+    adv::Advertisement,
+    gatt::{
+        local::{
+            characteristic_control, Application, Characteristic, CharacteristicControlEvent,
+            CharacteristicNotify, CharacteristicNotifyMethod, CharacteristicWrite,
+            CharacteristicWriteMethod, Service,
+        },
+        remote::Characteristic as RemoteCharacteristic,
+        CharacteristicReader, CharacteristicWriter,
+    },
+    Adapter, AdapterEvent, Device, Uuid,
+};
+use chacha20poly1305::{
+    aead::{Aead, KeyInit, Payload},
+    ChaCha20Poly1305, Nonce,
+};
+use futures_lite::StreamExt;
+use iroh::{EndpointId, SecretKey, Signature};
+use sha2::{Digest, Sha256};
+use std::{os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
+
+const SERVICE_UUID: Uuid = Uuid::from_u128(0xe6d0d000_7d7a_4c6f_8d8a_7c4547444f44);
+const CHARACTERISTIC_UUID: Uuid = Uuid::from_u128(0xe6d0d001_7d7a_4c6f_8d8a_7c4547444f44);
+const SERVER_LABEL: &[u8] = b"egdod-ble-server-v1";
+const CLIENT_LABEL: &[u8] = b"egdod-ble-client-v1";
+const KEY_LABEL: &[u8] = b"egdod-ble-key-v1";
+const MAX_FRAME: usize = 64 * 1024;
+const SCAN_WAIT: Duration = Duration::from_secs(60);
+const EXCHANGE_WAIT: Duration = Duration::from_secs(30);
+
+struct ServerHello {
+    agent: EndpointId,
+    ephemeral: [u8; 32],
+    signature: Signature,
+}
+
+fn identity_message(
+    label: &[u8],
+    controller: &EndpointId,
+    agent: &EndpointId,
+    keys: &[[u8; 32]],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(label.len() + 64 + keys.len() * 32);
+    out.extend_from_slice(label);
+    out.extend_from_slice(controller.as_bytes());
+    out.extend_from_slice(agent.as_bytes());
+    for key in keys {
+        out.extend_from_slice(key);
+    }
+    out
+}
+
+fn server_hello(key: &SecretKey, controller: &EndpointId, ephemeral: [u8; 32]) -> Vec<u8> {
+    let agent = key.public();
+    let signature = key.sign(&identity_message(
+        SERVER_LABEL,
+        controller,
+        &agent,
+        &[ephemeral],
+    ));
+    let mut out = Vec::with_capacity(128);
+    out.extend_from_slice(agent.as_bytes());
+    out.extend_from_slice(&ephemeral);
+    out.extend_from_slice(&signature.to_bytes());
+    out
+}
+
+fn parse_server_hello(bytes: &[u8]) -> Result<ServerHello> {
+    if bytes.len() != 128 {
+        bail!("BLE server hello is {} bytes, expected 128", bytes.len());
+    }
+    let agent =
+        EndpointId::from_bytes(bytes[0..32].try_into().unwrap()).context("BLE agent node id")?;
+    let ephemeral = bytes[32..64].try_into().unwrap();
+    let signature = Signature::from_bytes(bytes[64..128].try_into().unwrap());
+    Ok(ServerHello {
+        agent,
+        ephemeral,
+        signature,
+    })
+}
+
+fn session_key(shared: [u8; 32], transcript: &[u8]) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(KEY_LABEL)
+        .chain_update(shared)
+        .chain_update(transcript)
+        .finalize()
+        .into()
+}
+
+fn nonce(n: u8) -> Nonce {
+    let mut bytes = [0u8; 12];
+    bytes[11] = n;
+    *Nonce::from_slice(&bytes)
+}
+
+fn crypt(key: &[u8; 32], n: u8, aad: &[u8], clear: &[u8]) -> Result<Vec<u8>> {
+    ChaCha20Poly1305::new(key.into())
+        .encrypt(&nonce(n), Payload { msg: clear, aad })
+        .map_err(|_| anyhow::anyhow!("BLE encryption failed"))
+}
+
+fn decrypt(key: &[u8; 32], n: u8, aad: &[u8], cipher: &[u8]) -> Result<Vec<u8>> {
+    ChaCha20Poly1305::new(key.into())
+        .decrypt(&nonce(n), Payload { msg: cipher, aad })
+        .map_err(|_| anyhow::anyhow!("BLE credential authentication failed"))
+}
+
+fn network_conf(ssid: &str, psk: &str) -> Result<String> {
+    if ssid.is_empty()
+        || ssid.len() > 32
+        || ssid.contains(['\n', '\0'])
+    {
+        bail!("SSID must be 1–32 bytes without a newline or NUL");
+    }
+    let raw = psk.len() == 64 && psk.bytes().all(|b| b.is_ascii_hexdigit());
+    let psk_ok = (8..=63).contains(&psk.len()) || raw;
+    if !psk_ok || psk.contains(['\n', '\0']) {
+        bail!("PSK must be 8–63 bytes or 64 hexadecimal digits");
+    }
+    let ssid = ssid.replace('\\', "\\\\").replace('"', "\\\"");
+    let psk = psk.replace('\\', "\\\\").replace('"', "\\\"");
+    let psk_line = if raw {
+        format!("psk={psk}")
+    } else {
+        format!("psk=\"{psk}\"")
+    };
+    Ok(format!(
+        "network={{\n\tssid=\"{ssid}\"\n\t{psk_line}\n\tkey_mgmt=WPA-PSK\n}}\n"
+    ))
+}
+
+fn install(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".ble.tmp.{}", std::process::id()));
+    let tmp = std::path::PathBuf::from(name);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    file.write_all(bytes).context("writing BLE credentials")?;
+    file.sync_all().context("flushing BLE credentials")?;
+    drop(file);
+    std::fs::rename(&tmp, path).with_context(|| format!("installing {}", path.display()))
+}
+
+async fn write_frame(writer: &mut CharacteristicWriter, bytes: &[u8]) -> Result<()> {
+    if bytes.len() > MAX_FRAME {
+        bail!("BLE frame exceeds {MAX_FRAME} bytes");
+    }
+    writer
+        .write_all(&(bytes.len() as u32).to_be_bytes())
+        .await?;
+    writer.write_all(bytes).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+async fn read_frame(reader: &mut CharacteristicReader) -> Result<Vec<u8>> {
+    let mut size = [0u8; 4];
+    reader.read_exact(&mut size).await?;
+    let size = u32::from_be_bytes(size) as usize;
+    if size > MAX_FRAME {
+        bail!("BLE frame declares {size} bytes, limit is {MAX_FRAME}");
+    }
+    let mut out = vec![0u8; size];
+    reader.read_exact(&mut out).await?;
+    Ok(out)
+}
+
+async fn adapter() -> Result<(Adapter, bool)> {
+    let session = bluer::Session::new()
+        .await
+        .context("connecting to bluetoothd")?;
+    let adapter = session
+        .default_adapter()
+        .await
+        .context("finding a Bluetooth adapter")?;
+    let powered = adapter.is_powered().await?;
+    if !powered {
+        adapter.set_powered(true).await?;
+    }
+    Ok((adapter, powered))
+}
+
+pub fn local_name(id: &EndpointId) -> String {
+    format!("egdod-{}", &id.to_string()[..8])
+}
+
+pub async fn serve(controller: EndpointId, key_file: &Path, output: &Path) -> Result<()> {
+    let key = crate::state::load_or_create_key(key_file, crate::state::OnUnusable::Replace)?;
+    let agent = key.public();
+    let (adapter, was_powered) = adapter().await?;
+    let result = serve_on_adapter(&adapter, controller, key, agent, output).await;
+    if !was_powered {
+        let _ = adapter.set_powered(false).await;
+    }
+    result
+}
+
+async fn serve_on_adapter(
+    adapter: &Adapter,
+    controller: EndpointId,
+    key: SecretKey,
+    agent: EndpointId,
+    output: &Path,
+) -> Result<()> {
+    let advertisement = Advertisement {
+        service_uuids: [SERVICE_UUID].into_iter().collect(),
+        local_name: Some(local_name(&agent)),
+        discoverable: Some(true),
+        ..Default::default()
+    };
+    let adv = adapter.advertise(advertisement).await?;
+    let (mut control, handle) = characteristic_control();
+    let app = Application {
+        services: vec![Service {
+            uuid: SERVICE_UUID,
+            primary: true,
+            characteristics: vec![Characteristic {
+                uuid: CHARACTERISTIC_UUID,
+                write: Some(CharacteristicWrite {
+                    write: true,
+                    write_without_response: true,
+                    method: CharacteristicWriteMethod::Io,
+                    ..Default::default()
+                }),
+                notify: Some(CharacteristicNotify {
+                    notify: true,
+                    method: CharacteristicNotifyMethod::Io,
+                    ..Default::default()
+                }),
+                control_handle: handle,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let app = adapter.serve_gatt_application(app).await?;
+    eprintln!(
+        "egdod: BLE first hop {} advertising {}",
+        agent,
+        local_name(&agent)
+    );
+    loop {
+        let attempt = tokio::time::timeout(EXCHANGE_WAIT, async {
+            let mut reader: Option<CharacteristicReader> = None;
+            let mut writer: Option<CharacteristicWriter> = None;
+            while reader.is_none() || writer.is_none() {
+                match control.next().await {
+                    Some(CharacteristicControlEvent::Write(request)) => {
+                        let next = request.accept()?;
+                        if writer.as_ref().is_some_and(|w| w.device_address() != next.device_address()) {
+                            writer = None;
+                        }
+                        reader = Some(next);
+                    }
+                    Some(CharacteristicControlEvent::Notify(next)) => {
+                        if reader.as_ref().is_some_and(|r| r.device_address() != next.device_address()) {
+                            reader = None;
+                        }
+                        writer = Some(next);
+                    }
+                    None => bail!("BLE GATT service stopped"),
+                }
+            }
+            let mut reader = reader.unwrap();
+            let mut writer = writer.unwrap();
+            let mut random = [0u8; 32];
+            getrandom::getrandom(&mut random).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
+            let secret = StaticSecret::from(random);
+            let server_ephemeral = XPublicKey::from(&secret).to_bytes();
+            let hello = server_hello(&key, &controller, server_ephemeral);
+            write_frame(&mut writer, &hello).await?;
+            let request = read_frame(&mut reader).await?;
+            if request.len() < 128 + 16 {
+                bail!("BLE credential request is too short");
+            }
+            let claimed_controller = EndpointId::from_bytes(request[0..32].try_into().unwrap())
+                .context("BLE controller node id")?;
+            if claimed_controller != controller {
+                bail!("BLE write came from a controller other than the one baked into the image");
+            }
+            let client_ephemeral: [u8; 32] = request[32..64].try_into().unwrap();
+            let signature = Signature::from_bytes(request[64..128].try_into().unwrap());
+            let client_message = identity_message(
+                CLIENT_LABEL,
+                &controller,
+                &agent,
+                &[server_ephemeral, client_ephemeral],
+            );
+            controller
+                .verify(&client_message, &signature)
+                .context("verifying BLE controller identity")?;
+            let mut transcript = hello;
+            transcript.extend_from_slice(&request[..128]);
+            let shared = secret
+                .diffie_hellman(&XPublicKey::from(client_ephemeral))
+                .to_bytes();
+            let session_key = session_key(shared, &transcript);
+            let conf = decrypt(&session_key, 0, &transcript, &request[128..])?;
+            if conf.is_empty() {
+                bail!("BLE credential file is empty");
+            }
+            install(output, &conf)?;
+            let ack = crypt(&session_key, 1, &transcript, b"ok")?;
+            write_frame(&mut writer, &ack).await?;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
+        match attempt {
+            Ok(Ok(())) => break,
+            Ok(Err(error)) => eprintln!("egdod: refused BLE provisioning attempt: {error:#}"),
+            Err(_) => eprintln!("egdod: BLE provisioning attempt timed out"),
+        }
+    }
+    eprintln!("egdod: network credentials received over BLE");
+    drop(app);
+    drop(adv);
+    Ok(())
+}
+
+async fn characteristic(device: &Device) -> Result<RemoteCharacteristic> {
+    for _ in 0..20 {
+        for service in device.services().await? {
+            if service.uuid().await? != SERVICE_UUID {
+                continue;
+            }
+            for characteristic in service.characteristics().await? {
+                if characteristic.uuid().await? == CHARACTERISTIC_UUID {
+                    return Ok(characteristic);
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    bail!("egdod BLE characteristic did not appear")
+}
+
+pub async fn provision(
+    controller_key: SecretKey,
+    expected_agent: EndpointId,
+    ssid: String,
+    psk: String,
+) -> Result<()> {
+    let conf = network_conf(&ssid, &psk)?;
+    let expected_name = local_name(&expected_agent);
+    let (adapter, was_powered) = adapter().await?;
+    let result = async {
+        let mut events = adapter.discover_devices_with_changes().await?;
+        let device = tokio::time::timeout(SCAN_WAIT, async {
+            while let Some(event) = events.next().await {
+                let AdapterEvent::DeviceAdded(address) = event else { continue };
+                let device = adapter.device(address)?;
+                if device.name().await?.as_deref() == Some(expected_name.as_str())
+                    && device.uuids().await?.unwrap_or_default().contains(&SERVICE_UUID)
+                {
+                    return Ok::<_, anyhow::Error>(device);
+                }
+            }
+            bail!("Bluetooth discovery ended before the requested target appeared")
+        })
+        .await
+        .context("waiting for the requested BLE target")??;
+        drop(events);
+        device.connect().await.context("connecting to BLE target")?;
+        let exchange = tokio::time::timeout(EXCHANGE_WAIT, async {
+            let characteristic = characteristic(&device).await?;
+            let mut notify = characteristic.notify_io().await?;
+            let mut write = characteristic.write_io().await?;
+            let hello = read_frame(&mut notify).await?;
+            let hello = parse_server_hello(&hello)?;
+            if hello.agent != expected_agent {
+                bail!("BLE target node id does not match the requested agent");
+            }
+            let controller = controller_key.public();
+            expected_agent
+                .verify(
+                    &identity_message(SERVER_LABEL, &controller, &expected_agent, &[hello.ephemeral]),
+                    &hello.signature,
+                )
+                .context("verifying BLE target identity")?;
+            let mut random = [0u8; 32];
+            getrandom::getrandom(&mut random).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
+            let secret = StaticSecret::from(random);
+            let client_ephemeral = XPublicKey::from(&secret).to_bytes();
+            let signature = controller_key.sign(&identity_message(
+                CLIENT_LABEL,
+                &controller,
+                &expected_agent,
+                &[hello.ephemeral, client_ephemeral],
+            ));
+            let mut request = Vec::with_capacity(128);
+            request.extend_from_slice(controller.as_bytes());
+            request.extend_from_slice(&client_ephemeral);
+            request.extend_from_slice(&signature.to_bytes());
+            let mut transcript = server_hello_bytes(&hello);
+            transcript.extend_from_slice(&request);
+            let shared = secret.diffie_hellman(&XPublicKey::from(hello.ephemeral)).to_bytes();
+            let session_key = session_key(shared, &transcript);
+            request.extend_from_slice(&crypt(&session_key, 0, &transcript, conf.as_bytes())?);
+            write_frame(&mut write, &request).await?;
+            let ack = read_frame(&mut notify).await?;
+            if decrypt(&session_key, 1, &transcript, &ack)? != b"ok" {
+                bail!("BLE target returned an invalid acknowledgement");
+            }
+            eprintln!("egdod: {expected_agent} accepted network credentials over BLE; waiting for its normal IP dial");
+            Ok(())
+        })
+        .await
+        .context("BLE provisioning exchange timed out")
+        .and_then(|result| result);
+        let _ = device.disconnect().await;
+        exchange
+    }
+    .await;
+    if !was_powered {
+        let _ = adapter.set_powered(false).await;
+    }
+    result
+}
+
+fn server_hello_bytes(hello: &ServerHello) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128);
+    out.extend_from_slice(hello.agent.as_bytes());
+    out.extend_from_slice(&hello.ephemeral);
+    out.extend_from_slice(&hello.signature.to_bytes());
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_proofs_bind_both_nodes_and_ephemeral_keys() {
+        let controller = SecretKey::from_bytes(&[1; 32]);
+        let agent = SecretKey::from_bytes(&[2; 32]);
+        let server_key = [3; 32];
+        let client_key = [4; 32];
+        let message = identity_message(
+            CLIENT_LABEL,
+            &controller.public(),
+            &agent.public(),
+            &[server_key, client_key],
+        );
+        let signature = controller.sign(&message);
+        controller.public().verify(&message, &signature).unwrap();
+        let changed = identity_message(
+            CLIENT_LABEL,
+            &controller.public(),
+            &agent.public(),
+            &[server_key, [5; 32]],
+        );
+        assert!(controller.public().verify(&changed, &signature).is_err());
+    }
+
+    #[test]
+    fn credentials_are_authenticated_and_confined_to_network_syntax() {
+        let key = session_key([7; 32], b"transcript");
+        let clear = network_conf("lab", "correct horse").unwrap().into_bytes();
+        let cipher = crypt(&key, 0, b"transcript", &clear).unwrap();
+        assert_eq!(
+            String::from_utf8(decrypt(&key, 0, b"transcript", &cipher).unwrap()).unwrap(),
+            "network={\n\tssid=\"lab\"\n\tpsk=\"correct horse\"\n\tkey_mgmt=WPA-PSK\n}\n"
+        );
+        let mut corrupt = cipher;
+        corrupt[0] ^= 1;
+        assert!(decrypt(&key, 0, b"transcript", &corrupt).is_err());
+        assert!(network_conf("x\nnetwork={", "12345678").is_err());
+    }
+
+    #[test]
+    fn advertisement_name_is_derived_from_the_agent_node_id() {
+        let id = SecretKey::from_bytes(&[9; 32]).public();
+        assert_eq!(local_name(&id), format!("egdod-{}", &id.to_string()[..8]));
+    }
+}
