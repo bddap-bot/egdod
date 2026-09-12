@@ -119,8 +119,10 @@ enum ControllerCmd {
     },
     Ble {
         agent: String,
-        #[arg(long, num_args = 2, value_names = ["SSID", "PSK"])]
-        network: Vec<String>,
+        #[arg(long, value_name = "SSID")]
+        network: String,
+        #[arg(long, value_name = "PATH")]
+        psk_file: PathBuf,
     },
     /// The controller's own view of itself, including whether it is dialable.
     Status {
@@ -280,12 +282,17 @@ async fn run_controller(state: StateDir, cmd: ControllerCmd) -> Result<()> {
                 },
             )
         }
-        ControllerCmd::Ble { agent, network } => {
+        ControllerCmd::Ble {
+            agent,
+            network,
+            psk_file,
+        } => {
             let agent = parse_pubkey(&agent).context("agent node id")?;
-            let [ssid, psk]: [String; 2] = network
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("--network requires SSID and PSK"))?;
-            ble::provision(state.load_key()?, agent, ssid, psk).await
+            let psk = std::fs::read_to_string(&psk_file)
+                .with_context(|| format!("reading PSK from {}", psk_file.display()))?;
+            let psk = psk.strip_suffix('\n').unwrap_or(&psk);
+            let psk = psk.strip_suffix('\r').unwrap_or(psk);
+            ble::provision(state.load_key()?, agent, network, psk.to_owned()).await
         }
         ControllerCmd::Status { json } => std::process::exit(controller::status(&state, json)?),
         ControllerCmd::Exec { agent, argv } => {

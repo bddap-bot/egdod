@@ -70,7 +70,7 @@ egdod controller push <agent> <local-path> <remote-path>
 egdod controller pull <agent> <remote-path> <local-path>
 egdod controller forward <agent> <local-port> <remote-addr:port>
 egdod controller join [--iface <dev>]           # join the access point a target hosts for this key
-egdod controller ble <agent> --network <ssid> <psk>
+egdod controller ble <agent> --network <ssid> --psk-file <path>
 egdod link <nodeid> [--json | --hostapd <dev> | --supplicant]
 egdod agent --controller <nodeid> [--relay <url> | --no-relay] [--direct <addr:port>]
 ```
@@ -167,7 +167,8 @@ stops Bluetooth, joins that network through the existing station path, takes DHC
 same IP dial as every other link.
 
 The target advertises the fixed egdod GATT service with local name `egdod-` followed by the first
-eight hexadecimal digits of its node id. `egdod controller ble <agent-node-id> --network SSID PSK`
+eight hexadecimal digits of its node id. `egdod controller ble <agent-node-id> --network SSID
+--psk-file PATH`
 scans for that service, connects only to the requested node id and proves both identities before it
 sends credentials. Each side signs the protocol label, both node ids and its ephemeral X25519 key
 with its iroh Ed25519 identity; the target accepts only the controller id baked into the image, and
@@ -175,6 +176,7 @@ the controller accepts only the agent id named on its command line. The shared X
 the signed transcript derive a ChaCha20-Poly1305 key, so the network credentials are neither clear
 text nor writable by a radio that lacks the controller key. Payloads are bounded at 64 KiB and a
 credential file is installed atomically at mode 0600.
+The PSK comes from a file rather than the process argument list.
 
 BlueZ supplies the radio and GATT implementation on both ends. The initramfs carries `bluetoothd`,
 the D-Bus daemon it uses and their pinned closures; the existing binary supplies the GATT target and
