@@ -18,6 +18,8 @@
         "boot/init.c",
       "boot/image.nix",
       "boot/dbus-system.conf",
+      "boot/passwd",
+      "boot/group",
         "Cargo.toml",
         "Cargo.lock"
       ],
