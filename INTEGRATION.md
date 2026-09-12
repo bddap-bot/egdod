@@ -117,6 +117,50 @@ machine, whose firmware is not OVMF, and a session across two genuinely separate
 networks. The stick is written for that test; until it runs, "boots under Secure
 Boot" means "boots under OVMF with Microsoft keys".
 
+## Onto a network without a cable
+
+The v0 stick assumed Ethernet. A laptop with no port and no keyboard needs the
+stick to find a network by itself, and there were two ways to give it one:
+bake the credentials in, or have the target host an access point and take the
+credentials over it. Both are in, in that order of preference, for a reason
+that is about the controller rather than the target: a controller that joins
+the target's access point gives up its own upstream — a laptop with one radio
+then has no internet, and a phone reaches the target only from an app bound to
+that network while its default route stays on cellular. So the baked network is
+the primary path and the derived access point is the fallback for a target
+that finds nothing it knows.
+
+The trade the primary path makes is stated plainly: the network's SSID and PSK
+sit on the stick in plaintext, in the initramfs. That is the same class of
+artifact as an installer stick carrying a preseed file with a wifi password,
+and it is why `write-stick.sh` bakes them at write time rather than the image
+build carrying them — the image in the nix store stays credential-free
+(`SPEC.md` property 1 is about the controller's secret; a stick with a wifi
+password on it is a provisioning object to be treated like one). Whoever
+writes the stick chooses what goes on it: the writing host's own network by
+default, any number of `--network SSID PSK` besides.
+
+The fallback needs no decision from anyone: the SSID, PSK, addresses and port
+are all derived from the controller's public node id, so the controller
+computes them from the key it already trusts and the target computes them from
+the id it already carries. Joining that access point buys a link and nothing
+else; approval by public key gates everything, exactly as on any network. It
+was tempting to hand the credentials over as a new verb; instead the first
+approved command is a plain `push` of a `wpa_supplicant.conf`, which the
+target's init treats as the same file `write-stick.sh` would have baked. One
+file format, one join path, one network bring-up in `boot/init.c`: wired, then
+baked station, then access point.
+
+Wireless on unknown hardware needs firmware the kernel would otherwise fetch
+from a distro. The image carries Debian's non-free set for Intel, Atheros,
+Realtek, Broadcom, MediaTek and Marvell Libertas radios, compressed, and loads
+drivers by modalias at boot instead of the fixed module list the wired stick
+had. For a machine whose built-in radio is outside that set, the zero-code
+fallback is a USB Ethernet adapter or a USB wireless dongle whose driver and
+firmware are in it (`cdc_ether`, `r8152`, `ath9k_htc`, `rtl8xxxu`, `mt7921u`
+and the like are all present). `PROOF.md` records what the set costs in bytes
+and which drivers were actually exercised, which is fewer than it covers.
+
 ## A controller that is always serving
 
 The written image names exactly one node id, so a persistent controller serves

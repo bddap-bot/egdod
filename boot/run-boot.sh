@@ -2,6 +2,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+MODE=${EGDOD_BOOT_LINK:-wired}
+case "$MODE" in wired|station|ap) ;; *) echo "EGDOD_BOOT_LINK must be wired, station or ap" >&2; exit 2;; esac
+
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/egdod-boot.XXXXXX")
 SERIAL=$WORK/serial.log
 STATE=$WORK/controller
@@ -17,8 +20,8 @@ say() { printf '\n=== %s\n' "$*"; }
 clean_serial() { sed 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\x1b[=>]//g' "$SERIAL" | tr -d '\r'; }
 save_serial() {
   if [ -n "${BOTQ_ARTIFACTS_DIR:-}" ]; then
-    clean_serial > "$BOTQ_ARTIFACTS_DIR/boot-serial.log"
-    echo "serial log saved to $BOTQ_ARTIFACTS_DIR/boot-serial.log"
+    clean_serial > "$BOTQ_ARTIFACTS_DIR/boot-$MODE-serial.log"
+    echo "serial log saved to $BOTQ_ARTIFACTS_DIR/boot-$MODE-serial.log"
   fi
 }
 
@@ -36,6 +39,10 @@ say "controller init"
 NODE_ID=$(grep -oE '[0-9a-f]{64}' "$WORK/init.out" | head -1)
 echo "controller node id: $NODE_ID"
 PORT=${EGDOD_BOOT_PORT:-52847}
+if [ "$MODE" = ap ]; then
+  PORT=$("$BIN" link "$NODE_ID" | sed -n 's/^port=//p')
+  echo "derived link:"; "$BIN" link "$NODE_ID"
+fi
 
 boot() {
   for attempt in 1 2 3; do
@@ -73,6 +80,45 @@ wait_serial() {
   done
   return 1
 }
+
+if [ "$MODE" != wired ]; then
+  say "building the stick image dialing the rig's controller inside the VM (10.99.0.1:$PORT)"
+  IMG=$(nix-build --no-out-link boot/image.nix --argstr controllerNodeId "$NODE_ID" --argstr direct "10.99.0.1:$PORT")
+  cat "$IMG/sizes.txt"
+
+  say "baking the hwsim proof rig into a copy of the image"
+  OV=$WORK/overlay
+  mkdir -p "$OV/bin" "$OV/rig" "$OV/rig-state"
+  cp boot/rig.sh "$OV/init"
+  zcat "$IMG/initrd.img" | ( cd "$OV" && cpio -i --quiet --to-stdout init ) > "$OV/init.egdod"
+  chmod +x "$OV/init" "$OV/init.egdod"
+  cp "$(nix-build --no-out-link nixpkgs.nix -A pkgsStatic.iw)/bin/iw" "$OV/bin/iw"
+  cp "$(nix-build --no-out-link nixpkgs.nix -A pkgsStatic.hostapd)/bin/hostapd" "$OV/bin/hostapd"
+  echo "$PORT" > "$OV/rig/port"
+  echo "$MODE" > "$OV/rig/mode"
+  echo egdod-proof > "$OV/rig/proof-ssid"
+  echo proof-network-psk > "$OV/rig/proof-psk"
+  cp "$STATE/controller.key" "$OV/rig-state/controller.key"
+  boot/networks.sh --no-host --network "$(cat "$OV/rig/proof-ssid")" "$(cat "$OV/rig/proof-psk")" > "$OV/rig/proof.conf"
+  if [ "$MODE" = station ]; then
+    cp "$OV/rig/proof.conf" "$OV/wpa_supplicant.conf"
+    echo "--- baked networks:"; cat "$OV/wpa_supplicant.conf"
+  fi
+  boot/bake.sh "$IMG/esp.img" "$WORK/esp.img" "$OV"
+
+  boot "$WORK/esp.img" -nic none
+  say "watching the rig (no wired device in this VM; two hwsim radios in the rig's netns, one with the target)"
+  if ! wait_serial "RIG: ($MODE OK|DEFECT)" 150; then
+    echo "DEFECT: the rig reached no verdict" >&2; clean_serial | tail -40 >&2; save_serial; exit 1
+  fi
+  say "rig and init lines from the serial console:"
+  clean_serial | grep -aE "^(RIG:|init:|agent pubkey)" | head -40
+  save_serial
+  clean_serial | grep -aq "RIG: $MODE OK" || { echo "DEFECT on the serial console" >&2; exit 1; }
+  echo
+  echo "BOOT OK ($MODE): Secure Boot on, no wired device, the target reached the controller over wireless and was served as root."
+  exit 0
+fi
 
 z32() {
   local hex=$1 alpha=ybndrfg8ejkmcpqxot1uwisza345h769 out="" acc=0 bits=0 i

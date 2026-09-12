@@ -19,7 +19,10 @@
 #include <unistd.h>
 
 #define WIRED_WAIT 10
+#define STATION_WAIT 30
+#define AP_WAIT 15
 #define DHCP_WAIT 20
+#define NETWORKS "/wpa_supplicant.conf"
 
 static char cmdline[8192];
 
@@ -84,6 +87,29 @@ static int run(char **av) {
     return st;
 }
 
+static int capture(char **av, char *buf, size_t cap) {
+    int p[2];
+    if (pipe(p)) return -1;
+    pid_t c = fork();
+    if (c == 0) {
+        dup2(p[1], 1);
+        close(p[0]);
+        close(p[1]);
+        execv(av[0], av);
+        _exit(127);
+    }
+    close(p[1]);
+    if (c < 0) { close(p[0]); return -1; }
+    size_t n = 0;
+    ssize_t r;
+    while (n < cap - 1 && (r = read(p[0], buf + n, cap - 1 - n)) > 0) n += r;
+    buf[n] = 0;
+    close(p[0]);
+    int st;
+    waitpid(c, &st, 0);
+    return st ? -1 : (int)n;
+}
+
 static void stop(pid_t *p) {
     if (*p <= 0) return;
     kill(*p, SIGTERM);
@@ -121,7 +147,7 @@ static void set_addr(const char *dev, const char *ip, const char *mask) {
     struct sockaddr_in *sin = (struct sockaddr_in *)&ifr.ifr_addr;
     unsigned long reqs[] = { SIOCSIFADDR, SIOCSIFNETMASK };
     const char *vals[] = { ip, mask };
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < (mask ? 2 : 1); i++) {
         memset(&ifr, 0, sizeof ifr);
         strncpy(ifr.ifr_name, dev, IFNAMSIZ - 1);
         sin->sin_family = AF_INET;
@@ -159,13 +185,15 @@ static void default_route(const char *dev, const char *gw) {
     close(fd);
 }
 
-enum kind { NONE, WIRED };
+enum kind { NONE, WIRED, STATION, AP };
 
 struct link {
     enum kind kind;
     char dev[IFNAMSIZ];
+    char dial[64];
     pid_t daemon;
     pid_t dhcp;
+    struct stat networks;
 };
 
 static struct link up;
@@ -231,10 +259,93 @@ static int wait_wired(void) {
     return 0;
 }
 
+static int wait_carrier(int secs) {
+    for (int t = 0; t < secs; t++) {
+        if (carrier(up.dev)) return 1;
+        if (up.daemon > 0 && waitpid(up.daemon, NULL, WNOHANG) == up.daemon) { up.daemon = -1; return 0; }
+        sleep(1);
+    }
+    return 0;
+}
+
+static int station(void) {
+    if (!wireless[0] || access(NETWORKS, R_OK)) return 0;
+    snprintf(up.dev, sizeof up.dev, "%s", wireless);
+    iface_up(up.dev);
+    char *av[] = { "/bin/wpa_supplicant", "-i", up.dev, "-c", NETWORKS, NULL };
+    up.daemon = spawn(av);
+    printf("init: %s scanning for a baked network, up to %ds\n", up.dev, STATION_WAIT);
+    if (wait_carrier(STATION_WAIT)) return 1;
+    printf("init: no baked network in range on %s\n", up.dev);
+    stop(&up.daemon);
+    return 0;
+}
+
+static int field(const char *text, const char *key, char *out, size_t cap) {
+    size_t kl = strlen(key);
+    for (const char *p = text; p && *p; p = strchr(p, '\n') ? strchr(p, '\n') + 1 : NULL) {
+        if (strncmp(p, key, kl) || p[kl] != '=') continue;
+        const char *v = p + kl + 1;
+        size_t n = strcspn(v, "\n");
+        if (n >= cap) return 0;
+        memcpy(out, v, n);
+        out[n] = 0;
+        return 1;
+    }
+    return 0;
+}
+
+static int access_point(void) {
+    const char *id = arg("egdod.controller");
+    if (!wireless[0] || !id) return 0;
+    snprintf(up.dev, sizeof up.dev, "%s", wireless);
+    char *idw = dup_word(id);
+    char text[1024], conf[1024], ssid[64], target[32], controller[32], port[8], prefix[4];
+    char *lav[] = { "/egdod", "link", idw, NULL };
+    char *hav[] = { "/egdod", "link", idw, "--hostapd", up.dev, NULL };
+    if (capture(lav, text, sizeof text) < 0 || capture(hav, conf, sizeof conf) < 0) {
+        printf("init: egdod link %s failed\n", idw);
+        return 0;
+    }
+    if (!field(text, "ssid", ssid, sizeof ssid) || !field(text, "target", target, sizeof target)
+        || !field(text, "controller", controller, sizeof controller) || !field(text, "port", port, sizeof port)
+        || !field(text, "prefix", prefix, sizeof prefix)) {
+        printf("init: egdod link printed an incomplete derivation\n");
+        return 0;
+    }
+    int fd = open("/hostapd.conf", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0 || write(fd, conf, strlen(conf)) != (ssize_t)strlen(conf)) {
+        printf("init: writing /hostapd.conf errno=%d\n", errno);
+        return 0;
+    }
+    close(fd);
+    snprintf(up.dial, sizeof up.dial, "%s:%s", controller, port);
+    struct in_addr m = { htonl(~0u << (32 - atoi(prefix))) };
+    iface_up(up.dev);
+    set_addr(up.dev, target, inet_ntoa(m));
+    char *av[] = { "/bin/hostapd", "/hostapd.conf", NULL };
+    up.daemon = spawn(av);
+    if (!wait_carrier(AP_WAIT)) {
+        printf("init: hostapd did not bring %s up\n", up.dev);
+        stop(&up.daemon);
+        return 0;
+    }
+    if (stat(NETWORKS, &up.networks)) memset(&up.networks, 0, sizeof up.networks);
+    printf("init: link access-point %s on %s as %s; the controller dials in at %s\n", ssid, up.dev, target, up.dial);
+    return 1;
+}
+
+static int networks_changed(void) {
+    struct stat st;
+    if (stat(NETWORKS, &st)) return 0;
+    return st.st_ino != up.networks.st_ino || st.st_mtim.tv_sec != up.networks.st_mtim.tv_sec
+        || st.st_mtim.tv_nsec != up.networks.st_mtim.tv_nsec;
+}
+
 static void bring_down(void) {
     stop(&up.daemon);
     if (up.dhcp > 0) { kill(up.dhcp, SIGTERM); up.dhcp = -1; }
-    if (up.dev[0]) set_addr(up.dev, "0.0.0.0", "0.0.0.0");
+    if (up.dev[0]) set_addr(up.dev, "0.0.0.0", NULL);
     memset(&up, 0, sizeof up);
     up.daemon = up.dhcp = -1;
 }
@@ -242,16 +353,26 @@ static void bring_down(void) {
 static void bring_up(void) {
     bring_down();
     coldplug();
-    if (!wait_wired()) {
-        printf("init: no wired carrier\n");
+    if (wait_wired()) {
+        up.kind = WIRED;
+        printf("init: link wired %s\n", up.dev);
+        const char *ip = arg("egdod.ip");
+        if (!ip) { dhcp(); return; }
+        set_addr(up.dev, dup_word(ip), arg("egdod.mask") ? dup_word(arg("egdod.mask")) : "255.255.255.0");
+        if (arg("egdod.gw")) default_route(up.dev, dup_word(arg("egdod.gw")));
         return;
     }
-    up.kind = WIRED;
-    printf("init: link wired %s\n", up.dev);
-    const char *ip = arg("egdod.ip");
-    if (!ip) { dhcp(); return; }
-    set_addr(up.dev, dup_word(ip), arg("egdod.mask") ? dup_word(arg("egdod.mask")) : "255.255.255.0");
-    if (arg("egdod.gw")) default_route(up.dev, dup_word(arg("egdod.gw")));
+    if (station()) {
+        up.kind = STATION;
+        printf("init: link station %s\n", up.dev);
+        dhcp();
+        return;
+    }
+    if (access_point()) {
+        up.kind = AP;
+        return;
+    }
+    printf("init: no link%s\n", wireless[0] ? "" : " and no wireless device");
 }
 
 static char **agent_argv(void) {
@@ -264,9 +385,15 @@ static char **agent_argv(void) {
     av[n++] = c ? dup_word(c) : "";
     av[n++] = "--key-file";
     av[n++] = "/agent.key";
-    if (flag("egdod.norelay")) av[n++] = "--no-relay";
-    if (arg("egdod.relay")) { av[n++] = "--relay"; av[n++] = dup_word(arg("egdod.relay")); }
-    if (arg("egdod.direct")) { av[n++] = "--direct"; av[n++] = dup_word(arg("egdod.direct")); }
+    if (up.kind == AP) {
+        av[n++] = "--no-relay";
+        av[n++] = "--direct";
+        av[n++] = up.dial;
+    } else {
+        if (flag("egdod.norelay")) av[n++] = "--no-relay";
+        if (arg("egdod.relay")) { av[n++] = "--relay"; av[n++] = dup_word(arg("egdod.relay")); }
+        if (arg("egdod.direct")) { av[n++] = "--direct"; av[n++] = dup_word(arg("egdod.direct")); }
+    }
     av[n] = NULL;
     return av;
 }
@@ -376,6 +503,9 @@ int main(void) {
             switch_root(&agent, av);
         } else if (lost_link) {
             printf("init: link daemon exited; bringing the link up again\n");
+            relink(&agent, &av);
+        } else if (up.kind == AP && networks_changed()) {
+            printf("init: network credentials received over the access point\n");
             relink(&agent, &av);
         }
         struct timespec ts = { 1, 0 };
