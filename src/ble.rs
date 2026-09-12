@@ -112,23 +112,30 @@ fn decrypt(key: &[u8; 32], n: u8, aad: &[u8], cipher: &[u8]) -> Result<Vec<u8>> 
 }
 
 fn network_conf(ssid: &str, psk: &str) -> Result<String> {
-    if ssid.is_empty() || ssid.len() > 32 || ssid.contains(['\n', '\0']) {
-        bail!("SSID must be 1–32 bytes without a newline or NUL");
+    if ssid.is_empty() || ssid.len() > 32 || ssid.contains(['\n', '\r', '\0']) {
+        bail!("SSID must be 1–32 bytes without a line break or NUL");
     }
     let raw = psk.len() == 64 && psk.bytes().all(|b| b.is_ascii_hexdigit());
     let psk_ok = (8..=63).contains(&psk.len()) || raw;
-    if !psk_ok || psk.contains(['\n', '\0']) {
+    if !psk_ok || psk.contains(['\n', '\r', '\0']) {
         bail!("PSK must be 8–63 bytes or 64 hexadecimal digits");
     }
-    let ssid = ssid.replace('\\', "\\\\").replace('"', "\\\"");
-    let psk = psk.replace('\\', "\\\\").replace('"', "\\\"");
+    let encode = |value: &str| {
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\u{1b}', "\\e")
+            .replace('\t', "\\t")
+    };
+    let ssid = encode(ssid);
+    let psk = encode(psk);
     let psk_line = if raw {
         format!("psk={psk}")
     } else {
-        format!("psk=\"{psk}\"")
+        format!("psk=P\"{psk}\"")
     };
     Ok(format!(
-        "network={{\n\tssid=\"{ssid}\"\n\t{psk_line}\n\tkey_mgmt=WPA-PSK\n}}\n"
+        "network={{\n\tssid=P\"{ssid}\"\n\t{psk_line}\n\tkey_mgmt=WPA-PSK\n}}\n"
     ))
 }
 
@@ -493,7 +500,7 @@ mod tests {
         let cipher = crypt(&key, 0, b"transcript", &clear).unwrap();
         assert_eq!(
             String::from_utf8(decrypt(&key, 0, b"transcript", &cipher).unwrap()).unwrap(),
-            "network={\n\tssid=\"lab\"\n\tpsk=\"correct horse\"\n\tkey_mgmt=WPA-PSK\n}\n"
+            "network={\n\tssid=P\"lab\"\n\tpsk=P\"correct horse\"\n\tkey_mgmt=WPA-PSK\n}\n"
         );
         assert!(decrypt(&key, 0, b"other transcript", &cipher).is_err());
         let mut corrupt = cipher;
@@ -504,10 +511,13 @@ mod tests {
         assert!(network_conf("lab", &"g".repeat(64)).is_err());
         assert!(network_conf("lab", &"a".repeat(63))
             .unwrap()
-            .contains("psk=\""));
+            .contains("psk=P\""));
         assert!(network_conf("lab", &"ab".repeat(32))
             .unwrap()
             .contains("psk=abab"));
+        let escaped = network_conf("lab\\\"", "tab\tpass").unwrap();
+        assert!(escaped.contains("ssid=P\"lab\\\\\\\"\""));
+        assert!(escaped.contains("psk=P\"tab\\tpass\""));
     }
 
     #[test]
