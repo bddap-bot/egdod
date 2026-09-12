@@ -267,21 +267,21 @@ async fn serve_on_adapter(
                 match control.next().await {
                     Some(CharacteristicControlEvent::Write(request)) => {
                         let next = request.accept()?;
-                        if writer
-                            .as_ref()
-                            .is_some_and(|w| w.device_address() != next.device_address())
-                        {
-                            writer = None;
+                        let address = next.device_address();
+                        if peer.is_some_and(|peer| peer != address) {
+                            let _ = adapter.remove_device(address).await;
+                            continue;
                         }
+                        peer = Some(address);
                         reader = Some(next);
                     }
                     Some(CharacteristicControlEvent::Notify(next)) => {
-                        if reader
-                            .as_ref()
-                            .is_some_and(|r| r.device_address() != next.device_address())
-                        {
-                            reader = None;
+                        let address = next.device_address();
+                        if peer.is_some_and(|peer| peer != address) {
+                            let _ = adapter.remove_device(address).await;
+                            continue;
                         }
+                        peer = Some(address);
                         writer = Some(next);
                     }
                     None => bail!("BLE GATT service stopped"),
@@ -289,7 +289,6 @@ async fn serve_on_adapter(
             }
             let mut reader = reader.unwrap();
             let mut writer = writer.unwrap();
-            peer = Some(reader.device_address());
             let mut random = [0u8; 32];
             getrandom::getrandom(&mut random).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
             let secret = StaticSecret::from(random);
