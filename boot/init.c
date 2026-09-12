@@ -578,9 +578,14 @@ int main(void) {
         } else if (lost_link) {
             printf("init: link daemon exited; bringing the link up again\n");
             relink(&agent, &av);
+        } else if (up.kind == BLE && time(NULL) >= retry_at) {
+            retry_at = time(NULL) + RETRY_WAIT;
+            if (wired_ready()) {
+                printf("init: wired carrier appeared; leaving BLE provisioning\n");
+                relink(&agent, &av);
+            }
         } else if (time(NULL) >= retry_at
-                   && (up.kind == NONE || (up.kind == BLE && wired_ready())
-                       || (up.dev[0] && !carrier(up.dev)))) {
+                   && (up.kind == NONE || (up.dev[0] && !carrier(up.dev)))) {
             printf("init: %s; bringing the link up again\n", up.kind == NONE ? "no link" : "carrier lost");
             relink(&agent, &av);
             retry_at = time(NULL) + RETRY_WAIT;
