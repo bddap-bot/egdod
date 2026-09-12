@@ -119,6 +119,8 @@ let
     ln -s ${pkgs.bluez}/bin/bluetoothd rootfs/bin/bluetoothd
     ln -s ${pkgs.dbus}/bin/dbus-daemon rootfs/bin/dbus-daemon
     cp ${./dbus-system.conf} rootfs/etc/dbus-1/system.conf
+    cp ${./passwd} rootfs/etc/passwd
+    cp ${./group} rootfs/etc/group
     cp ${./udhcpc.script} rootfs/bin/udhcpc.script
     chmod +x rootfs/bin/udhcpc.script
     cp -r ${drivers}/lib rootfs/lib

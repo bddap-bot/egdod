@@ -28,6 +28,7 @@ const CHARACTERISTIC_UUID: Uuid = Uuid::from_u128(0xe6d0d001_7d7a_4c6f_8d8a_7c45
 const SERVER_LABEL: &[u8] = b"egdod-ble-server-v1";
 const CLIENT_LABEL: &[u8] = b"egdod-ble-client-v1";
 const KEY_LABEL: &[u8] = b"egdod-ble-key-v1";
+const START: u8 = 1;
 const MAX_FRAME: usize = 64 * 1024;
 const SCAN_WAIT: Duration = Duration::from_secs(60);
 const EXCHANGE_WAIT: Duration = Duration::from_secs(30);
@@ -266,6 +267,7 @@ async fn serve_on_adapter(
     );
     loop {
         let mut peer = None;
+        let mut installed = false;
         let attempt = tokio::time::timeout(EXCHANGE_WAIT, async {
             let mut reader: Option<CharacteristicReader> = None;
             let mut writer: Option<CharacteristicWriter> = None;
@@ -295,6 +297,11 @@ async fn serve_on_adapter(
             }
             let mut reader = reader.unwrap();
             let mut writer = writer.unwrap();
+            let mut start = [0];
+            reader.read_exact(&mut start).await?;
+            if start[0] != START {
+                bail!("BLE provisioning start marker is invalid");
+            }
             let mut random = [0u8; 32];
             getrandom::getrandom(&mut random).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
             let secret = StaticSecret::from(random);
@@ -332,6 +339,7 @@ async fn serve_on_adapter(
                 bail!("BLE credential file is empty");
             }
             install(output, &conf)?;
+            installed = true;
             let ack = crypt(&session_key, 1, &transcript, b"ok")?;
             if let Err(error) = write_frame(&mut writer, &ack).await {
                 eprintln!("egdod: credentials installed but BLE acknowledgement failed: {error:#}");
@@ -346,6 +354,7 @@ async fn serve_on_adapter(
         match attempt {
             Ok(Ok(())) => break,
             Ok(Err(error)) => eprintln!("egdod: refused BLE provisioning attempt: {error:#}"),
+            Err(_) if installed => break,
             Err(_) => eprintln!("egdod: BLE provisioning attempt timed out"),
         }
     }
@@ -405,6 +414,8 @@ pub async fn provision(
             let characteristic = characteristic(&device).await?;
             let mut notify = characteristic.notify_io().await?;
             let mut write = characteristic.write_io().await?;
+            write.write_all(&[START]).await?;
+            write.flush().await?;
             let hello_bytes = read_frame(&mut notify).await?;
             let hello = parse_server_hello(&hello_bytes)?;
             if hello.agent != expected_agent {
