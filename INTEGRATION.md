@@ -117,6 +117,15 @@ machine, whose firmware is not OVMF, and a session across two genuinely separate
 networks. The stick is written for that test; until it runs, "boots under Secure
 Boot" means "boots under OVMF with Microsoft keys".
 
+### Booting on Intel Macs
+
+Intel Macs from 2012–2017 have no Secure Boot and show the shim as `EFI Boot` in
+the Option-key startup picker. T2 models need Startup Security Utility configured
+for external media and `No Security`; 2006–2007 models with 32-bit EFI are out of
+scope. Apple USB Ethernet uses the in-kernel `asix` driver and Thunderbolt
+Ethernet uses `tg3`. Broadcom wireless firmware is only partly covered by the
+non-free set in the image, so wired Ethernet is the proven path on these machines.
+
 ## Onto a network without a cable
 
 The v0 stick assumed Ethernet. A laptop with no port and no keyboard needs the
