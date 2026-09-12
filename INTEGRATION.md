@@ -158,7 +158,21 @@ was tempting to hand the credentials over as a new verb; instead the first
 approved command is a plain `push` of a `wpa_supplicant.conf`, which the
 target's init treats as the same file `write-stick.sh` would have baked. One
 file format, one join path, one network bring-up in `boot/init.c`: wired, then
-baked station, then access point.
+baked station, then access point, then BLE.
+
+BLE adds no second agent or session path. The target advertises `egdod-` plus
+the first eight hexadecimal digits of its node id. The controller supplies the
+expected target id, an SSID and a PSK file:
+
+```sh
+egdod controller ble <agent-node-id> --network <ssid> --psk-file <path>
+```
+
+The peers prove the controller and target keys before an encrypted credential
+frame can be installed. The target then stops Bluetooth and feeds the resulting
+`wpa_supplicant.conf` back into the existing station transition. Its subsequent
+IP dial and public-key approval are unchanged; proximity grants network
+provisioning, never an egdod capability.
 
 Wireless on unknown hardware needs firmware the kernel would otherwise fetch
 from a distro. The image carries Debian's non-free set for Intel, Atheros,
