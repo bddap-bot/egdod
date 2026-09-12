@@ -103,8 +103,9 @@ ask for revocation and it was left alone rather than half-built.
 on a machine that already booted. The boot itself is now built and watched, in
 `boot/` and in `PROOF.md`. The pieces the earlier account listed as missing are there:
 a kernel and an initramfs with the agent as `init`; the static binary that
-survives a datagram; the NIC driver and both ways to bring the link up, static
-and DHCP; and a stick image, produced by a nix derivation from a distro-signed
+survives a datagram; every driver Debian builds for that kernel plus the
+non-free firmware they ask for, loaded by modalias, and both ways to bring the
+link up, static and DHCP; and a stick image, produced by a nix derivation from a distro-signed
 chain pinned by hash. `boot/run-boot.sh` boots it under OVMF with Secure Boot
 enforcing, the agent dials out and is approved and runs as root, and the
 initramfs receives a root filesystem over the wire and `switch_root`s into it.

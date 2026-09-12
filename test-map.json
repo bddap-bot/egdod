@@ -37,7 +37,7 @@
       "tests": [
         "bash -n boot/run-boot.sh"
       ],
-      "why": "the qemu/OVMF Secure-Boot boot harness — a full run needs OVMF firmware, a controller and a booted VM, so the gate checks syntax only; run `bash boot/run-boot.sh` manually to exercise it"
+      "why": "the qemu/OVMF Secure-Boot boot harness — a full run needs OVMF firmware, KVM, a controller and a booted VM, so the gate checks syntax only; run `bash boot/run-boot.sh` manually (EGDOD_BOOT_NIC, EGDOD_BOOT_RELAY=1) to exercise it"
     },
     {
       "paths": [
