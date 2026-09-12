@@ -345,6 +345,7 @@ static int access_point(void) {
 static int bluetooth(void) {
     const char *id = arg("egdod.controller");
     if (!id || access("/bin/bluetoothd", X_OK) || access("/bin/dbus-daemon", X_OK)) return 0;
+    if (up.dev[0]) set_addr(up.dev, "0.0.0.0", NULL);
     up.dev[0] = 0;
     mkdir("/run", 0755);
     mkdir("/run/dbus", 0755);
@@ -550,7 +551,7 @@ int main(void) {
                 agent = spawn(av);
             } else if (w == up.daemon) {
                 up.daemon = -1;
-                if (up.kind == BLE && WIFEXITED(st) && WEXITSTATUS(st) == 0) provisioned = 1;
+                if (up.kind == BLE && ((WIFEXITED(st) && WEXITSTATUS(st) == 0) || networks_changed())) provisioned = 1;
                 else lost_link = 1;
             } else if (w == up.dhcp) {
                 up.dhcp = -1;
@@ -560,8 +561,8 @@ int main(void) {
         }
         if (access("/switch.req", F_OK) == 0) {
             switch_root(&agent, av);
-        } else if ((up.kind == AP || up.kind == BLE) && networks_changed()) {
-            printf("init: network credentials received over %s\n", up.kind == BLE ? "BLE" : "the access point");
+        } else if (up.kind == AP && networks_changed()) {
+            printf("init: network credentials received over the access point\n");
             relink(&agent, &av);
         } else if (provisioned) {
             printf("init: BLE provisioning complete\n");
@@ -569,7 +570,8 @@ int main(void) {
         } else if (lost_link) {
             printf("init: link daemon exited; bringing the link up again\n");
             relink(&agent, &av);
-        } else if ((up.kind == NONE || (up.dev[0] && !carrier(up.dev))) && time(NULL) >= retry_at) {
+        } else if ((up.kind == NONE || (up.kind == BLE && !networks_changed())
+                    || (up.dev[0] && !carrier(up.dev))) && time(NULL) >= retry_at) {
             printf("init: %s; bringing the link up again\n", up.kind == NONE ? "no link" : "carrier lost");
             relink(&agent, &av);
             retry_at = time(NULL) + RETRY_WAIT;
