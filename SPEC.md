@@ -89,6 +89,16 @@ screen with which to tell anyone. The controller must actively verify it is dial
 is not — republish, restart the endpoint, or at minimum log loudly and expose the state. A controller
 that cannot tell the difference between "no targets today" and "nobody can find me" is incomplete.
 
+## The stick image: compatibility over compactness
+
+USB media are cheap and the target is unknown, so the image optimises for booting on whatever it
+meets, never for size. It carries the complete Debian kernel module set — not a curated subset —
+and the full non-free firmware set, pinned by hash like the kernel, and `init` loads drivers by
+walking every device's modalias through modprobe rather than from a list. Size is never a reason
+to drop a driver, a firmware blob, or a module tree; `PROOF.md` records what the image weighs as a
+fact, not as a cost to reduce. `egdod.mods=` on the command line names only what a modalias cannot
+express (`efivarfs`).
+
 ## Explicit non-goals for v0
 
 No OS installer, no disko or partitioning, no image building, no Secure Boot work, no BLE, no

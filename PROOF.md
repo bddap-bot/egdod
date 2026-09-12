@@ -526,15 +526,100 @@ and finds its controller by node id through the public relay, but only the
 `--no-relay --direct` path and a DHCP lease were observed in the VM — the
 relay dial-in on real hardware is the next thing to watch, not a thing watched.
 
+### Drivers by modalias, every module and every firmware blob, and a relayed dial from the stick
+
+The first stick written for a real machine booted its signed chain, brought the
+kernel up under Secure Boot, started the agent, and then dialed nothing: the
+image loaded exactly two modules named on its command line, `e1000` and
+`efivarfs`, and the laptop's Ethernet chip was neither, so `udhcpc` never bound,
+`/etc/resolv.conf` never existed, and every dial failed with `No addressing
+information available`. A list of drivers is the wrong shape for an image meant
+for unknown hardware.
+
+The image now carries the complete Debian module set for its kernel — all of
+`/lib/modules/6.12.96+deb13-amd64/kernel`, with `modules.dep`, `modules.alias`
+and `modules.order` generated at build time — and the full non-free firmware set
+from the same Debian snapshot (27 packages, pinned by hash like the kernel),
+each blob compressed with `xz --check=crc32` so the kernel's firmware loader
+reads it in place. `init` loads drivers by walking every device's `modalias`
+under `/sys/bus/{pci,usb,sdio,platform,virtio}` through `modprobe`, again after
+each second of the carrier wait so late-enumerating USB devices are caught, and
+again before every re-link; `egdod.mods=` on the command line names only what a
+modalias cannot express (`efivarfs`). The kernel's own module requests
+(`/sbin/modprobe` for `crypto-ccm(aes)` when a wireless key is installed, for
+instance) reach the same busybox.
+
+What the image weighs, as built (`sizes.txt` in the derivation output):
+
+| part | size |
+|---|---|
+| `/lib/modules` (complete, `.ko.xz` as Debian ships them) | 104 MB |
+| `/lib/firmware` (27 non-free packages, xz-compressed in place) | 436 MB |
+| `/bin` (busybox, wpa_supplicant, hostapd, static) | 23 MB |
+| `initrd.img` | 537 MB |
+| `esp.img` | 618 MB |
+
+`boot/run-boot.sh` was watched twice with a NIC the old image could not have
+driven and no module named anywhere:
+
+- `EGDOD_BOOT_NIC=virtio-net-pci EGDOD_BOOT_RELAY=1`: the image carried no
+  `egdod.direct` and no relay URL, the controller served through the public
+  relay bound to loopback so nothing but the relay could reach it, and the
+  target had to find it by node id. On the serial console:
+
+```
+EFI stub: UEFI Secure Boot is enabled.
+init: link wired eth0
+udhcpc: lease of 10.0.2.15 obtained from 10.0.2.2, lease time 86400
+init: egdod PID 1 up, launching agent
+egdod::agent: egdod agent starting controller=4d1ff39dea4aec04fa3899e5ad0a0ed3d87d14a5ff233564c3da5b349a16b321
+agent pubkey: b600794aea0c4e8feb0da55c174ff63639ecbb81c39de95c0467d108ec3ad744
+egdod::agent: connected to controller via relayed (https://usw1-1.relay.n0.iroh.link./)
+egdod::agent: controller has not approved b600794aea0c4e8feb0da55c174ff63639ecbb81c39de95c0467d108ec3ad744 yet; retrying
+egdod::agent: connected to controller via relayed (https://usw1-1.relay.n0.iroh.link./)
+init: switch_root into /newroot exec /sbin/init
+NEWROOT-INIT: switch_root landed; the received OS is PID 1 now
+```
+
+  And the controller's published record, resolved from this host while the
+  target was dialing:
+
+```
+_iroh.jwx988xkjmsyj6tau8144noq4xc84fff9htuk3gd5jpujgosscoo.dns.iroh.link descriptive text "relay=https://usw1-1.relay.n0.iroh.link./"
+egdod::controller: reachability confirmed: a stranger can dial us path=relayed mode=Discovery
+egdod::controller: agent connected agent=b600794aea0c4e8feb0da55c174ff63639ecbb81c39de95c0467d108ec3ad744 path=relayed remote=https://usw1-1.relay.n0.iroh.link./
+```
+
+- `EGDOD_BOOT_NIC=e1000e`: the same image, a second driver found by modalias,
+  DHCP, the direct dial, exec as root, Secure Boot on, switch_root.
+
+```
+e1000e: Intel(R) PRO/1000 Network Driver
+e1000e: Copyright(c) 1999 - 2015 Intel Corporation.
+e1000e 0000:00:01.0: Interrupt Throttling Rate (ints/sec) set to dynamic conservative mode
+e1000e 0000:00:01.0 0000:00:01.0 (uninitialized): registered PHC clock
+e1000e 0000:00:01.0 eth0: (PCI Express:2.5GT/s:Width x1) 52:54:00:12:34:56
+e1000e 0000:00:01.0 eth0: Intel(R) PRO/1000 Network Connection
+e1000e 0000:00:01.0 eth0: MAC: 3, PHY: 8, PBA No: 000000-000
+init: 1 wired device(s), waiting up to 10s for a carrier
+e1000e 0000:00:01.0 eth0: NIC Link is Up 1000 Mbps Full Duplex, Flow Control: Rx/Tx
+init: link wired eth0
+```
+
+Which drivers were *exercised*: `e1000`, `e1000e`, `virtio_net` (this section),
+`mac80211_hwsim` (below). The set *covers* every driver Debian builds for this
+kernel; "covers" is an inference about the machine in front of you, "exercised"
+is what was watched.
+
 ## What the agent needs from its environment
 
 `SPEC.md` property 4 asks for this to be written down here, and made explicit on
 the command line where possible. The agent needs:
 
-- **A working network interface, already up and addressed.** Nothing in egdod
-  brings a link up, loads a driver, or speaks DHCP. This is the largest
-  unstated dependency: on a bare target something else must have configured the
-  NIC before the agent can dial.
+- **A working network interface, already up and addressed.** Nothing in the
+  agent brings a link up, loads a driver, or speaks DHCP; on the stick that
+  something is `boot/init.c`, which loads drivers by modalias and runs `udhcpc`
+  before launching the agent.
 - **A writable path for `--key-file`** (default `/var/lib/egdod/agent.key`), and
   its parent directory creatable. On a tmpfs initramfs this means a new identity
   per boot.
