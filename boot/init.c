@@ -272,11 +272,30 @@ static int wired_ready(void) {
     struct dirent *e;
     int ready = 0;
     while ((e = readdir(d))) {
-        if (e->d_name[0] == '.' || !strcmp(e->d_name, "lo") || is_wireless(e->d_name)) continue;
+        if (e->d_name[0] == '.' || !strcmp(e->d_name, "lo")) continue;
+        if (is_wireless(e->d_name)) {
+            if (!wireless[0]) snprintf(wireless, sizeof wireless, "%s", e->d_name);
+            continue;
+        }
         iface_up(e->d_name);
         if (carrier(e->d_name)) { ready = 1; break; }
     }
     closedir(d);
+    return ready;
+}
+
+static int station_ready(void) {
+    if (!wireless[0] || access(NETWORKS, R_OK)) return 0;
+    iface_up(wireless);
+    char *av[] = { "/bin/wpa_supplicant", "-i", wireless, "-c", NETWORKS, NULL };
+    pid_t probe = spawn(av);
+    int ready = 0;
+    for (int t = 0; t < STATION_WAIT && probe > 0; t++) {
+        if (carrier(wireless)) { ready = 1; break; }
+        if (waitpid(probe, NULL, WNOHANG) == probe) { probe = -1; break; }
+        sleep(1);
+    }
+    stop(&probe);
     return ready;
 }
 
@@ -580,8 +599,8 @@ int main(void) {
             relink(&agent, &av);
         } else if (up.kind == BLE && time(NULL) >= retry_at) {
             retry_at = time(NULL) + RETRY_WAIT;
-            if (wired_ready()) {
-                printf("init: wired carrier appeared; leaving BLE provisioning\n");
+            if (wired_ready() || station_ready()) {
+                printf("init: a higher-priority link appeared; leaving BLE provisioning\n");
                 relink(&agent, &av);
             }
         } else if (time(NULL) >= retry_at
