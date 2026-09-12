@@ -19,7 +19,7 @@ use chacha20poly1305::{
 use futures_lite::StreamExt;
 use iroh::{EndpointId, SecretKey, Signature};
 use sha2::{Digest, Sha256};
-use std::{os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
+use std::{collections::HashSet, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 
@@ -32,6 +32,7 @@ const START: u8 = 1;
 const MAX_FRAME: usize = 64 * 1024;
 const SCAN_WAIT: Duration = Duration::from_secs(60);
 const EXCHANGE_WAIT: Duration = Duration::from_secs(30);
+const CHANNEL_WAIT: Duration = Duration::from_secs(3);
 
 struct ServerHello {
     agent: EndpointId,
@@ -215,11 +216,25 @@ pub async fn serve(controller: EndpointId, key_file: &Path, output: &Path) -> Re
     let key = crate::state::load_or_create_key(key_file, crate::state::OnUnusable::Replace)?;
     let agent = key.public();
     let (adapter, was_powered) = adapter().await?;
-    let result = serve_on_adapter(&adapter, controller, key, agent, output).await;
+    let result = tokio::select! {
+        result = serve_on_adapter(&adapter, controller, key, agent, output) => result,
+        result = termination() => {
+            result?;
+            bail!("BLE provisioning interrupted")
+        }
+    };
     if !was_powered {
         let _ = adapter.set_powered(false).await;
     }
     result
+}
+
+async fn termination() -> Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result.context("waiting for interrupt"),
+        _ = terminate.recv() => Ok(()),
+    }
 }
 
 async fn serve_on_adapter(
@@ -274,15 +289,13 @@ async fn serve_on_adapter(
             }
             None => bail!("BLE GATT service stopped"),
         };
-        let mut installed = false;
-        let attempt = tokio::time::timeout(EXCHANGE_WAIT, async {
+        let paired = tokio::time::timeout(CHANNEL_WAIT, async {
             while reader.is_none() || writer.is_none() {
                 match control.next().await {
                     Some(CharacteristicControlEvent::Write(request)) => {
                         let next = request.accept()?;
                         let address = next.device_address();
                         if peer != address {
-                            let _ = adapter.remove_device(address).await;
                             continue;
                         }
                         reader = Some(next);
@@ -290,7 +303,6 @@ async fn serve_on_adapter(
                     Some(CharacteristicControlEvent::Notify(next)) => {
                         let address = next.device_address();
                         if peer != address {
-                            let _ = adapter.remove_device(address).await;
                             continue;
                         }
                         writer = Some(next);
@@ -298,6 +310,16 @@ async fn serve_on_adapter(
                     None => bail!("BLE GATT service stopped"),
                 }
             }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
+        if let Err(error) = paired.context("BLE characteristic pairing timed out").and_then(|r| r) {
+            let _ = adapter.remove_device(peer).await;
+            eprintln!("egdod: refused BLE provisioning attempt: {error:#}");
+            continue;
+        }
+        let mut installed = false;
+        let attempt = tokio::time::timeout(EXCHANGE_WAIT, async {
             let mut reader = reader.unwrap();
             let mut writer = writer.unwrap();
             let mut start = [0];
@@ -391,81 +413,116 @@ pub async fn provision(
     let conf = network_conf(&ssid, &psk)?;
     let expected_name = local_name(&expected_agent);
     let (adapter, was_powered) = adapter().await?;
-    let result = async {
+    let provisioning = async {
         let known_devices = adapter.device_addresses().await?;
         let mut events = adapter.discover_devices_with_changes().await?;
-        let device = tokio::time::timeout(SCAN_WAIT, async {
-            while let Some(event) = events.next().await {
-                let AdapterEvent::DeviceAdded(address) = event else { continue };
-                let device = adapter.device(address)?;
-                if device.name().await?.as_deref() == Some(expected_name.as_str())
-                    && device.uuids().await?.unwrap_or_default().contains(&SERVICE_UUID)
-                {
-                    return Ok::<_, anyhow::Error>(device);
+        let deadline = tokio::time::Instant::now() + SCAN_WAIT;
+        let mut rejected = HashSet::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                bail!("waiting for the requested BLE target timed out");
+            }
+            let event = tokio::time::timeout(remaining, events.next())
+                .await
+                .context("waiting for the requested BLE target")?
+                .context("Bluetooth discovery ended before the requested target appeared")?;
+            let AdapterEvent::DeviceAdded(address) = event else {
+                continue;
+            };
+            if rejected.contains(&address) {
+                continue;
+            }
+            let device = adapter.device(address)?;
+            if device.name().await?.as_deref() == Some(expected_name.as_str())
+                && device.uuids().await?.unwrap_or_default().contains(&SERVICE_UUID)
+            {
+                rejected.insert(address);
+                let was_known = known_devices.contains(&device.address());
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    bail!("waiting for the requested BLE target timed out");
+                }
+                let attempt = tokio::time::timeout(EXCHANGE_WAIT.min(remaining), async {
+                    device.connect().await.context("connecting to BLE target")?;
+                    let characteristic = characteristic(&device).await?;
+                    let mut notify = characteristic.notify_io().await?;
+                    let mut write = characteristic.write_io().await?;
+                    write.write_all(&[START]).await?;
+                    write.flush().await?;
+                    let hello_bytes = read_frame(&mut notify).await?;
+                    let hello = parse_server_hello(&hello_bytes)?;
+                    if hello.agent != expected_agent {
+                        bail!("BLE target node id does not match the requested agent");
+                    }
+                    let controller = controller_key.public();
+                    expected_agent
+                        .verify(
+                            &identity_message(
+                                SERVER_LABEL,
+                                &controller,
+                                &expected_agent,
+                                &[hello.ephemeral],
+                            ),
+                            &hello.signature,
+                        )
+                        .context("verifying BLE target identity")?;
+                    let mut random = [0u8; 32];
+                    getrandom::getrandom(&mut random)
+                        .map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
+                    let secret = StaticSecret::from(random);
+                    let client_ephemeral = XPublicKey::from(&secret).to_bytes();
+                    let signature = controller_key.sign(&identity_message(
+                        CLIENT_LABEL,
+                        &controller,
+                        &expected_agent,
+                        &[hello.ephemeral, client_ephemeral],
+                    ));
+                    let mut request = Vec::with_capacity(128);
+                    request.extend_from_slice(controller.as_bytes());
+                    request.extend_from_slice(&client_ephemeral);
+                    request.extend_from_slice(&signature.to_bytes());
+                    let mut transcript = hello_bytes;
+                    transcript.extend_from_slice(&request);
+                    let shared = secret
+                        .diffie_hellman(&XPublicKey::from(hello.ephemeral))
+                        .to_bytes();
+                    let session_key = session_key(shared, &transcript);
+                    request.extend_from_slice(&crypt(
+                        &session_key,
+                        0,
+                        &transcript,
+                        conf.as_bytes(),
+                    )?);
+                    write_frame(&mut write, &request).await?;
+                    let ack = read_frame(&mut notify).await?;
+                    if decrypt(&session_key, 1, &transcript, &ack)? != b"ok" {
+                        bail!("BLE target returned an invalid acknowledgement");
+                    }
+                    eprintln!("egdod: {expected_agent} accepted network credentials over BLE; waiting for its normal IP dial");
+                    Ok(())
+                })
+                .await
+                .context("BLE provisioning exchange timed out")
+                .and_then(|result| result);
+                let _ = device.disconnect().await;
+                if !was_known {
+                    let _ = adapter.remove_device(device.address()).await;
+                }
+                match attempt {
+                    Ok(()) => return Ok::<(), anyhow::Error>(()),
+                    Err(error) => eprintln!("egdod: rejected BLE candidate {address}: {error:#}"),
                 }
             }
-            bail!("Bluetooth discovery ended before the requested target appeared")
-        })
-        .await
-        .context("waiting for the requested BLE target")??;
-        let was_known = known_devices.contains(&device.address());
-        drop(events);
-        device.connect().await.context("connecting to BLE target")?;
-        let exchange = tokio::time::timeout(EXCHANGE_WAIT, async {
-            let characteristic = characteristic(&device).await?;
-            let mut notify = characteristic.notify_io().await?;
-            let mut write = characteristic.write_io().await?;
-            write.write_all(&[START]).await?;
-            write.flush().await?;
-            let hello_bytes = read_frame(&mut notify).await?;
-            let hello = parse_server_hello(&hello_bytes)?;
-            if hello.agent != expected_agent {
-                bail!("BLE target node id does not match the requested agent");
-            }
-            let controller = controller_key.public();
-            expected_agent
-                .verify(
-                    &identity_message(SERVER_LABEL, &controller, &expected_agent, &[hello.ephemeral]),
-                    &hello.signature,
-                )
-                .context("verifying BLE target identity")?;
-            let mut random = [0u8; 32];
-            getrandom::getrandom(&mut random).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
-            let secret = StaticSecret::from(random);
-            let client_ephemeral = XPublicKey::from(&secret).to_bytes();
-            let signature = controller_key.sign(&identity_message(
-                CLIENT_LABEL,
-                &controller,
-                &expected_agent,
-                &[hello.ephemeral, client_ephemeral],
-            ));
-            let mut request = Vec::with_capacity(128);
-            request.extend_from_slice(controller.as_bytes());
-            request.extend_from_slice(&client_ephemeral);
-            request.extend_from_slice(&signature.to_bytes());
-            let mut transcript = hello_bytes;
-            transcript.extend_from_slice(&request);
-            let shared = secret.diffie_hellman(&XPublicKey::from(hello.ephemeral)).to_bytes();
-            let session_key = session_key(shared, &transcript);
-            request.extend_from_slice(&crypt(&session_key, 0, &transcript, conf.as_bytes())?);
-            write_frame(&mut write, &request).await?;
-            let ack = read_frame(&mut notify).await?;
-            if decrypt(&session_key, 1, &transcript, &ack)? != b"ok" {
-                bail!("BLE target returned an invalid acknowledgement");
-            }
-            eprintln!("egdod: {expected_agent} accepted network credentials over BLE; waiting for its normal IP dial");
-            Ok(())
-        })
-        .await
-        .context("BLE provisioning exchange timed out")
-        .and_then(|result| result);
-        let _ = device.disconnect().await;
-        if !was_known {
-            let _ = adapter.remove_device(device.address()).await;
         }
-        exchange
-    }
-    .await;
+    };
+    let result = tokio::select! {
+        result = provisioning => result,
+        result = termination() => {
+            result?;
+            bail!("BLE provisioning interrupted")
+        }
+    };
     if !was_powered {
         let _ = adapter.set_powered(false).await;
     }
