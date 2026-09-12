@@ -401,26 +401,34 @@ static void wired(void) {
     if (arg("egdod.gw")) default_route(up.dev, dup_word(arg("egdod.gw")));
 }
 
+static void stop_bluetooth(pid_t *helper) {
+    stop(helper);
+    stop(&up.bluetoothd);
+    stop(&up.dbus);
+}
+
 static int promote_from_ble(void) {
     pid_t helper = up.daemon;
     up.daemon = -1;
     coldplug();
     if (wait_wired()) {
-        stop(&helper);
-        stop(&up.bluetoothd);
-        stop(&up.dbus);
+        stop_bluetooth(&helper);
         wired();
         return 1;
     }
     if (station()) {
-        stop(&helper);
-        stop(&up.bluetoothd);
-        stop(&up.dbus);
+        stop_bluetooth(&helper);
         up.kind = STATION;
         printf("init: link station %s\n", up.dev);
         dhcp();
         return 1;
     }
+    if (access_point()) {
+        stop_bluetooth(&helper);
+        up.kind = AP;
+        return 1;
+    }
+    if (up.dev[0]) set_addr(up.dev, "0.0.0.0", NULL);
     up.dev[0] = 0;
     up.daemon = helper;
     return 0;
