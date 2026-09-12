@@ -88,6 +88,59 @@ fn parse_server_hello(bytes: &[u8]) -> Result<ServerHello> {
     })
 }
 
+fn verify_server_hello(
+    bytes: &[u8],
+    controller: &EndpointId,
+    expected_agent: &EndpointId,
+) -> Result<ServerHello> {
+    let hello = parse_server_hello(bytes)?;
+    if hello.agent != *expected_agent {
+        bail!("BLE target node id does not match the requested agent");
+    }
+    expected_agent
+        .verify(
+            &identity_message(
+                SERVER_LABEL,
+                controller,
+                expected_agent,
+                &[hello.ephemeral],
+            ),
+            &hello.signature,
+        )
+        .context("verifying BLE target identity")?;
+    Ok(hello)
+}
+
+fn verify_client_hello(
+    bytes: &[u8],
+    controller: &EndpointId,
+    agent: &EndpointId,
+    server_ephemeral: [u8; 32],
+) -> Result<[u8; 32]> {
+    if bytes.len() < 128 + 16 {
+        bail!("BLE credential request is too short");
+    }
+    let claimed_controller = EndpointId::from_bytes(bytes[0..32].try_into().unwrap())
+        .context("BLE controller node id")?;
+    if claimed_controller != *controller {
+        bail!("BLE write came from a controller other than the one baked into the image");
+    }
+    let client_ephemeral = bytes[32..64].try_into().unwrap();
+    let signature = Signature::from_bytes(bytes[64..128].try_into().unwrap());
+    controller
+        .verify(
+            &identity_message(
+                CLIENT_LABEL,
+                controller,
+                agent,
+                &[server_ephemeral, client_ephemeral],
+            ),
+            &signature,
+        )
+        .context("verifying BLE controller identity")?;
+    Ok(client_ephemeral)
+}
+
 fn session_key(shared: [u8; 32], transcript: &[u8]) -> [u8; 32] {
     Sha256::new()
         .chain_update(KEY_LABEL)
@@ -147,13 +200,13 @@ fn install(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut name = path.as_os_str().to_os_string();
     name.push(format!(".ble.tmp.{}", std::process::id()));
     let tmp = std::path::PathBuf::from(name);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
     let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
         file.write_all(bytes).context("writing BLE credentials")?;
         file.sync_all().context("flushing BLE credentials")?;
         drop(file);
@@ -165,10 +218,15 @@ fn install(path: &Path, bytes: &[u8]) -> Result<()> {
     result
 }
 
-async fn write_frame(writer: &mut CharacteristicWriter, bytes: &[u8]) -> Result<()> {
-    if bytes.len() > MAX_FRAME {
+fn frame_size(size: usize) -> Result<usize> {
+    if size > MAX_FRAME {
         bail!("BLE frame exceeds {MAX_FRAME} bytes");
     }
+    Ok(size)
+}
+
+async fn write_frame(writer: &mut CharacteristicWriter, bytes: &[u8]) -> Result<()> {
+    frame_size(bytes.len())?;
     writer
         .write_all(&(bytes.len() as u32).to_be_bytes())
         .await?;
@@ -181,9 +239,7 @@ async fn read_frame(reader: &mut CharacteristicReader) -> Result<Vec<u8>> {
     let mut size = [0u8; 4];
     reader.read_exact(&mut size).await?;
     let size = u32::from_be_bytes(size) as usize;
-    if size > MAX_FRAME {
-        bail!("BLE frame declares {size} bytes, limit is {MAX_FRAME}");
-    }
+    frame_size(size).with_context(|| format!("BLE frame declares {size} bytes"))?;
     let mut out = vec![0u8; size];
     reader.read_exact(&mut out).await?;
     Ok(out)
@@ -343,25 +399,8 @@ async fn serve_on_adapter(
             let hello = server_hello(&key, &controller, server_ephemeral);
             write_frame(&mut writer, &hello).await?;
             let request = read_frame(&mut reader).await?;
-            if request.len() < 128 + 16 {
-                bail!("BLE credential request is too short");
-            }
-            let claimed_controller = EndpointId::from_bytes(request[0..32].try_into().unwrap())
-                .context("BLE controller node id")?;
-            if claimed_controller != controller {
-                bail!("BLE write came from a controller other than the one baked into the image");
-            }
-            let client_ephemeral: [u8; 32] = request[32..64].try_into().unwrap();
-            let signature = Signature::from_bytes(request[64..128].try_into().unwrap());
-            let client_message = identity_message(
-                CLIENT_LABEL,
-                &controller,
-                &agent,
-                &[server_ephemeral, client_ephemeral],
-            );
-            controller
-                .verify(&client_message, &signature)
-                .context("verifying BLE controller identity")?;
+            let client_ephemeral =
+                verify_client_hello(&request, &controller, &agent, server_ephemeral)?;
             let mut transcript = hello;
             transcript.extend_from_slice(&request[..128]);
             let shared = secret
@@ -464,22 +503,9 @@ pub async fn provision(
                     write.write_all(&[START]).await?;
                     write.flush().await?;
                     let hello_bytes = read_frame(&mut notify).await?;
-                    let hello = parse_server_hello(&hello_bytes)?;
-                    if hello.agent != expected_agent {
-                        bail!("BLE target node id does not match the requested agent");
-                    }
                     let controller = controller_key.public();
-                    expected_agent
-                        .verify(
-                            &identity_message(
-                                SERVER_LABEL,
-                                &controller,
-                                &expected_agent,
-                                &[hello.ephemeral],
-                            ),
-                            &hello.signature,
-                        )
-                        .context("verifying BLE target identity")?;
+                    let hello =
+                        verify_server_hello(&hello_bytes, &controller, &expected_agent)?;
                     let mut random = [0u8; 32];
                     getrandom::getrandom(&mut random)
                         .map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
@@ -565,6 +591,20 @@ mod tests {
         let signature = controller.sign(&message);
         controller.public().verify(&message, &signature).unwrap();
         assert_eq!(message.len(), CLIENT_LABEL.len() + 128);
+        assert_eq!(&message[..CLIENT_LABEL.len()], CLIENT_LABEL);
+        assert_eq!(
+            &message[CLIENT_LABEL.len()..CLIENT_LABEL.len() + 32],
+            controller.public().as_bytes()
+        );
+        assert_eq!(
+            &message[CLIENT_LABEL.len() + 32..CLIENT_LABEL.len() + 64],
+            agent.public().as_bytes()
+        );
+        assert_eq!(
+            &message[CLIENT_LABEL.len() + 64..CLIENT_LABEL.len() + 96],
+            &server_key
+        );
+        assert_eq!(&message[CLIENT_LABEL.len() + 96..], &client_key);
         for offset in [
             0,
             CLIENT_LABEL.len(),
@@ -576,6 +616,78 @@ mod tests {
             changed[offset] ^= 1;
             assert!(controller.public().verify(&changed, &signature).is_err());
         }
+    }
+
+    #[test]
+    fn verification_rejects_wrong_identity_proofs() {
+        let controller = SecretKey::from_bytes(&[1; 32]);
+        let agent = SecretKey::from_bytes(&[2; 32]);
+        let stranger = SecretKey::from_bytes(&[3; 32]);
+        let server_ephemeral = [4; 32];
+        let good_server = server_hello(&agent, &controller.public(), server_ephemeral);
+        verify_server_hello(&good_server, &controller.public(), &agent.public()).unwrap();
+        let bad_server = server_hello(&stranger, &controller.public(), server_ephemeral);
+        assert!(verify_server_hello(&bad_server, &controller.public(), &agent.public()).is_err());
+
+        let client_ephemeral = [5; 32];
+        let message = identity_message(
+            CLIENT_LABEL,
+            &controller.public(),
+            &agent.public(),
+            &[server_ephemeral, client_ephemeral],
+        );
+        let mut request = Vec::new();
+        request.extend_from_slice(controller.public().as_bytes());
+        request.extend_from_slice(&client_ephemeral);
+        request.extend_from_slice(&controller.sign(&message).to_bytes());
+        request.extend_from_slice(&[0; 16]);
+        assert_eq!(
+            verify_client_hello(
+                &request,
+                &controller.public(),
+                &agent.public(),
+                server_ephemeral
+            )
+            .unwrap(),
+            client_ephemeral
+        );
+        request[64..128].copy_from_slice(&stranger.sign(&message).to_bytes());
+        assert!(verify_client_hello(
+            &request,
+            &controller.public(),
+            &agent.public(),
+            server_ephemeral
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn key_and_frame_boundaries_are_domain_separated() {
+        let expected: [u8; 32] = Sha256::new()
+            .chain_update(KEY_LABEL)
+            .chain_update([7; 32])
+            .chain_update(b"transcript")
+            .finalize()
+            .into();
+        assert_eq!(session_key([7; 32], b"transcript"), expected);
+        assert_ne!(session_key([7; 32], b"a"), session_key([7; 32], b"b"));
+        assert_ne!(session_key([7; 32], b"a"), session_key([8; 32], b"a"));
+        assert_ne!(nonce(0), nonce(1));
+        assert_eq!(MAX_FRAME, 64 * 1024);
+        assert_eq!(frame_size(MAX_FRAME).unwrap(), MAX_FRAME);
+        assert!(frame_size(MAX_FRAME + 1).is_err());
+    }
+
+    #[test]
+    fn hello_has_one_exact_encoding() {
+        let controller = SecretKey::from_bytes(&[1; 32]);
+        let agent = SecretKey::from_bytes(&[2; 32]);
+        let hello = server_hello(&agent, &controller.public(), [3; 32]);
+        assert!(parse_server_hello(&hello[..127]).is_err());
+        assert!(parse_server_hello(&hello).is_ok());
+        let mut trailing = hello;
+        trailing.push(0);
+        assert!(parse_server_hello(&trailing).is_err());
     }
 
     #[test]
@@ -592,7 +704,14 @@ mod tests {
         corrupt[0] ^= 1;
         assert!(decrypt(&key, 0, b"transcript", &corrupt).is_err());
         assert!(network_conf("x\nnetwork={", "12345678").is_err());
+        assert!(network_conf("", "12345678").is_err());
+        assert!(network_conf(&"x".repeat(33), "12345678").is_err());
+        assert!(network_conf(&"x".repeat(32), "12345678").is_ok());
+        assert!(network_conf("lab\r", "12345678").is_err());
         assert!(network_conf("lab", "1234567\n").is_err());
+        assert!(network_conf("lab", "1234567").is_err());
+        assert!(network_conf("lab", "12345678").is_ok());
+        assert!(network_conf("lab", "1234567\0").is_err());
         assert!(network_conf("lab", &"g".repeat(64)).is_err());
         assert!(network_conf("lab", &"a".repeat(63))
             .unwrap()
@@ -603,6 +722,43 @@ mod tests {
         assert!(network_conf("lab\\\"", "tab\tpass").is_err());
         assert!(network_conf("lab", "quote\"pass").is_err());
         assert!(network_conf("lab", "slash\\pass").is_err());
+        assert!(network_conf("a\tb", "12345678")
+            .unwrap()
+            .contains("ssid=610962\n"));
+    }
+
+    #[test]
+    fn install_is_private_atomic_and_cleans_up_failures() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("network.conf");
+        install(&output, b"new").unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"new");
+        assert_eq!(std::fs::metadata(&output).unwrap().permissions().mode() & 0o777, 0o600);
+
+        let target = root.path().join("target");
+        std::fs::write(&target, b"unchanged").unwrap();
+        std::fs::remove_file(&output).unwrap();
+        symlink(&target, &output).unwrap();
+        install(&output, b"replacement").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+        assert_eq!(std::fs::read(&output).unwrap(), b"replacement");
+        assert!(!std::fs::symlink_metadata(&output)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let blocked = root.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(install(&blocked, b"no").is_err());
+        let mut staging = blocked.as_os_str().to_os_string();
+        staging.push(format!(".ble.tmp.{}", std::process::id()));
+        assert!(!std::path::Path::new(&staging).exists());
+
+        std::fs::write(&staging, b"sentinel").unwrap();
+        assert!(install(&blocked, b"no").is_err());
+        assert_eq!(std::fs::read(&staging).unwrap(), b"sentinel");
     }
 
     #[test]
