@@ -382,6 +382,13 @@ static int networks_changed(void) {
         || st.st_mtim.tv_nsec != up.networks.st_mtim.tv_nsec;
 }
 
+static int networks_changed_from(struct stat before) {
+    struct stat st;
+    if (stat(NETWORKS, &st)) return 0;
+    return st.st_ino != before.st_ino || st.st_mtim.tv_sec != before.st_mtim.tv_sec
+        || st.st_mtim.tv_nsec != before.st_mtim.tv_nsec;
+}
+
 static void bring_down(void) {
     stop(&up.daemon);
     stop(&up.bluetoothd);
@@ -409,6 +416,7 @@ static void stop_bluetooth(pid_t *helper) {
 
 static int promote_from_ble(void) {
     pid_t helper = up.daemon;
+    struct stat before = up.networks;
     up.daemon = -1;
     coldplug();
     if (wait_wired()) {
@@ -426,6 +434,7 @@ static int promote_from_ble(void) {
     if (access_point()) {
         stop_bluetooth(&helper);
         up.kind = AP;
+        if (networks_changed_from(before)) return 2;
         return 1;
     }
     if (up.dev[0]) set_addr(up.dev, "0.0.0.0", NULL);
@@ -602,7 +611,11 @@ int main(void) {
             relink(&agent, &av);
         } else if (up.kind == BLE && time(NULL) >= retry_at) {
             retry_at = time(NULL) + RETRY_WAIT;
-            if (promote_from_ble()) {
+            int promoted = promote_from_ble();
+            if (promoted == 2) {
+                printf("init: network credentials received during link recovery\n");
+                relink(&agent, &av);
+            } else if (promoted) {
                 printf("init: a higher-priority link appeared; leaving BLE provisioning\n");
                 av = agent_argv();
                 agent = spawn(av);
