@@ -265,6 +265,20 @@ static int wait_wired(void) {
     return 0;
 }
 
+static int wired_ready(void) {
+    DIR *d = opendir("/sys/class/net");
+    if (!d) return 0;
+    struct dirent *e;
+    int ready = 0;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.' || !strcmp(e->d_name, "lo") || is_wireless(e->d_name)) continue;
+        iface_up(e->d_name);
+        if (carrier(e->d_name)) { ready = 1; break; }
+    }
+    closedir(d);
+    return ready;
+}
+
 static int wait_carrier(int secs) {
     for (int t = 0; t < secs; t++) {
         if (carrier(up.dev)) return 1;
@@ -563,7 +577,8 @@ int main(void) {
         } else if (lost_link) {
             printf("init: link daemon exited; bringing the link up again\n");
             relink(&agent, &av);
-        } else if ((up.kind == NONE || (up.dev[0] && !carrier(up.dev))) && time(NULL) >= retry_at) {
+        } else if ((up.kind == NONE || (up.kind == BLE && wired_ready())
+                    || (up.dev[0] && !carrier(up.dev))) && time(NULL) >= retry_at) {
             printf("init: %s; bringing the link up again\n", up.kind == NONE ? "no link" : "carrier lost");
             relink(&agent, &av);
             retry_at = time(NULL) + RETRY_WAIT;
