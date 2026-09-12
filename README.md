@@ -37,7 +37,8 @@ distro-signed chain plus our own unsigned initramfs — every driver Debian
 builds for that kernel and the full non-free firmware set, loaded by modalias —
 and `boot/run-boot.sh` was watched booting it under OVMF with Secure Boot
 enforcing: the agent runs as PID 1, finds a link (a cable, a baked wireless
-network, or an access point it hosts itself for the controller to join), dials
+network, an access point it hosts itself for the controller to join, or network
+credentials received over BLE), dials
 out — through the public relay when no address is baked in — is approved, runs
 a command as root inside the machine, and then receives a root filesystem over
 the wire and `switch_root`s into it. What is not yet watched is a boot on real
@@ -57,6 +58,7 @@ By hand:
 ```sh
 egdod controller init                                  # prints the node id; bake that into the image
 egdod controller serve &                               # long-lived
+egdod controller ble <agent> --network <ssid> --psk-file <path>
 egdod agent --controller <nodeid>                      # on the target; prints its own pubkey
 egdod controller pending --json                        # the key waiting to be let in
 egdod controller approve <agent-pubkey>
