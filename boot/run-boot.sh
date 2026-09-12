@@ -1,3 +1,6 @@
+    line=$(clean_serial 2>/dev/null | grep -aE "$pattern" | head -1 || true)
+    [ -n "$line" ] && { printf '%s\n' "$line"; return 0; }
+    kill -0 "$QEMU_PID" 2>/dev/null || { echo "qemu exited early" >&2; clean_serial | tail -40 >&2; return 1; }
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -73,9 +76,9 @@ start_vm() {
 wait_serial() {
   local pattern=$1 tries=$2 line
   for _ in $(seq 1 "$tries"); do
-    kill -0 "$QEMU_PID" 2>/dev/null || { echo "qemu exited early" >&2; clean_serial | tail -40 >&2; return 1; }
     line=$(clean_serial 2>/dev/null | grep -aE "$pattern" | head -1 || true)
     [ -n "$line" ] && { printf '%s\n' "$line"; return 0; }
+    kill -0 "$QEMU_PID" 2>/dev/null || { echo "qemu exited early" >&2; clean_serial | tail -40 >&2; return 1; }
     sleep 2
   done
   return 1
