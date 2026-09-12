@@ -626,6 +626,11 @@ mod tests {
         let server_ephemeral = [4; 32];
         let good_server = server_hello(&agent, &controller.public(), server_ephemeral);
         verify_server_hello(&good_server, &controller.public(), &agent.public()).unwrap();
+        let mut bad_signature = good_server.clone();
+        bad_signature[64] ^= 1;
+        assert!(
+            verify_server_hello(&bad_signature, &controller.public(), &agent.public()).is_err()
+        );
         let bad_server = server_hello(&stranger, &controller.public(), server_ephemeral);
         assert!(verify_server_hello(&bad_server, &controller.public(), &agent.public()).is_err());
 
@@ -708,7 +713,11 @@ mod tests {
         assert!(network_conf(&"x".repeat(33), "12345678").is_err());
         assert!(network_conf(&"x".repeat(32), "12345678").is_ok());
         assert!(network_conf("lab\r", "12345678").is_err());
+        assert!(network_conf("lab\0", "12345678").is_err());
+        assert!(network_conf("lab\"", "12345678").is_err());
+        assert!(network_conf("lab\\", "12345678").is_err());
         assert!(network_conf("lab", "1234567\n").is_err());
+        assert!(network_conf("lab", "1234567\r").is_err());
         assert!(network_conf("lab", "1234567").is_err());
         assert!(network_conf("lab", "12345678").is_ok());
         assert!(network_conf("lab", "1234567\0").is_err());
