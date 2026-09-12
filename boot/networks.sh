@@ -20,7 +20,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi; }
+as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi; }
 
 host_networks() {
   if command -v nmcli >/dev/null; then
@@ -29,7 +29,7 @@ host_networks() {
       name=$(printf '%s' "$name" | sed 's/\\:/:/g')
       ssid=$(as_root nmcli -s -g 802-11-wireless.ssid connection show "$name" 2>/dev/null) || true
       psk=$(as_root nmcli -s -g 802-11-wireless-security.psk connection show "$name" 2>/dev/null) || true
-      [ -n "$ssid" ] && [ -n "$psk" ] && printf '%s\n%s\n' "$ssid" "$psk"
+      if [ -n "$ssid" ] && [ -n "$psk" ]; then printf '%s\n%s\n' "$ssid" "$psk"; fi
     done
   fi
   if command -v wpa_cli >/dev/null; then

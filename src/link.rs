@@ -119,12 +119,12 @@ fn carrier(iface: &str) -> bool {
 pub async fn join(state: &StateDir, iface: &str) -> Result<()> {
     let link = derive(&state.load_key()?.public());
     eprintln!("egdod: joining {} on {iface}; the target dials {}:{}", link.ssid, link.controller, link.port);
-    let conf = state.root().join("link.conf");
-    std::fs::write(&conf, link.supplicant_conf())
-        .with_context(|| format!("writing {}", conf.display()))?;
     let cidr = format!("{}/{PREFIX_LEN}", link.controller);
     ip(&["link", "set", "dev", iface, "up"])?;
     ip(&["addr", "replace", &cidr, "dev", iface])?;
+    let conf = state.root().join("link.conf");
+    std::fs::write(&conf, link.supplicant_conf())
+        .with_context(|| format!("writing {}", conf.display()))?;
     let mut child = tokio::process::Command::new("wpa_supplicant")
         .args(["-i", iface, "-c"])
         .arg(&conf)

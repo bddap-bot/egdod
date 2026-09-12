@@ -22,6 +22,7 @@
 #define STATION_WAIT 30
 #define AP_WAIT 15
 #define DHCP_WAIT 20
+#define RETRY_WAIT 30
 #define NETWORKS "/wpa_supplicant.conf"
 
 static char cmdline[8192];
@@ -214,8 +215,11 @@ static void dhcp(void) {
     mkdir("/etc", 0755);
     char *av[] = { "/bin/busybox", "udhcpc", "-f", "-i", up.dev, "-s", "/bin/udhcpc.script", NULL };
     up.dhcp = spawn(av);
-    for (int t = 0; t < DHCP_WAIT && !has_addr(up.dev); t++) sleep(1);
-    if (!has_addr(up.dev)) printf("init: no lease on %s within %ds; udhcpc keeps trying\n", up.dev, DHCP_WAIT);
+    for (int t = 0; t < DHCP_WAIT && up.dhcp > 0 && !has_addr(up.dev); t++) {
+        if (waitpid(up.dhcp, NULL, WNOHANG) == up.dhcp) { up.dhcp = -1; break; }
+        sleep(1);
+    }
+    if (!has_addr(up.dev)) printf("init: no lease on %s within %ds%s\n", up.dev, DHCP_WAIT, up.dhcp > 0 ? "; udhcpc keeps trying" : " and udhcpc exited");
 }
 
 static int is_wireless(const char *dev) {
@@ -314,11 +318,12 @@ static int access_point(void) {
         return 0;
     }
     int fd = open("/hostapd.conf", O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0 || write(fd, conf, strlen(conf)) != (ssize_t)strlen(conf)) {
+    ssize_t wrote = fd < 0 ? -1 : write(fd, conf, strlen(conf));
+    if (fd >= 0) close(fd);
+    if (wrote != (ssize_t)strlen(conf)) {
         printf("init: writing /hostapd.conf errno=%d\n", errno);
         return 0;
     }
-    close(fd);
     snprintf(up.dial, sizeof up.dial, "%s:%s", controller, port);
     struct in_addr m = { htonl(~0u << (32 - atoi(prefix))) };
     iface_up(up.dev);
@@ -413,8 +418,9 @@ static char *word_at(const char *s, int idx) {
 
 static void switch_root(pid_t *agent, char **av) {
     char req[256] = {0};
-    if (read_file("/switch.req", req, sizeof req) < 0) return;
+    int got = read_file("/switch.req", req, sizeof req);
     unlink("/switch.req");
+    if (got < 0) { printf("init: /switch.req unreadable errno=%d; ignored\n", errno); return; }
     char newroot[256], initpath[256];
     snprintf(newroot, sizeof newroot, "%s", word_at(req, 0));
     snprintf(initpath, sizeof initpath, "%s", word_at(req, 1));
@@ -483,10 +489,12 @@ int main(void) {
 
     char **av = agent_argv();
     pid_t agent = spawn(av);
+    time_t retry_at = time(NULL) + RETRY_WAIT;
     for (;;) {
         int st;
         pid_t w;
         int lost_link = 0;
+        if (agent <= 0) agent = spawn(av);
         while ((w = waitpid(-1, &st, WNOHANG)) > 0) {
             if (w == agent) {
                 printf("init: agent exited; relaunching\n");
@@ -507,6 +515,10 @@ int main(void) {
         } else if (up.kind == AP && networks_changed()) {
             printf("init: network credentials received over the access point\n");
             relink(&agent, &av);
+        } else if ((up.kind == NONE || (up.dev[0] && !carrier(up.dev))) && time(NULL) >= retry_at) {
+            printf("init: %s; bringing the link up again\n", up.kind == NONE ? "no link" : "carrier lost");
+            relink(&agent, &av);
+            retry_at = time(NULL) + RETRY_WAIT;
         }
         struct timespec ts = { 1, 0 };
         nanosleep(&ts, NULL);
