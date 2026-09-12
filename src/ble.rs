@@ -112,10 +112,7 @@ fn decrypt(key: &[u8; 32], n: u8, aad: &[u8], cipher: &[u8]) -> Result<Vec<u8>> 
 }
 
 fn network_conf(ssid: &str, psk: &str) -> Result<String> {
-    if ssid.is_empty()
-        || ssid.len() > 32
-        || ssid.contains(['\n', '\0'])
-    {
+    if ssid.is_empty() || ssid.len() > 32 || ssid.contains(['\n', '\0']) {
         bail!("SSID must be 1–32 bytes without a newline or NUL");
     }
     let raw = psk.len() == 64 && psk.bytes().all(|b| b.is_ascii_hexdigit());
@@ -195,6 +192,15 @@ pub fn local_name(id: &EndpointId) -> String {
     format!("egdod-{}", &id.to_string()[..8])
 }
 
+fn advertisement(id: &EndpointId) -> Advertisement {
+    Advertisement {
+        service_uuids: [SERVICE_UUID].into_iter().collect(),
+        local_name: Some(local_name(id)),
+        discoverable: Some(true),
+        ..Default::default()
+    }
+}
+
 pub async fn serve(controller: EndpointId, key_file: &Path, output: &Path) -> Result<()> {
     let key = crate::state::load_or_create_key(key_file, crate::state::OnUnusable::Replace)?;
     let agent = key.public();
@@ -213,13 +219,7 @@ async fn serve_on_adapter(
     agent: EndpointId,
     output: &Path,
 ) -> Result<()> {
-    let advertisement = Advertisement {
-        service_uuids: [SERVICE_UUID].into_iter().collect(),
-        local_name: Some(local_name(&agent)),
-        discoverable: Some(true),
-        ..Default::default()
-    };
-    let adv = adapter.advertise(advertisement).await?;
+    let adv = adapter.advertise(advertisement(&agent)).await?;
     let (mut control, handle) = characteristic_control();
     let app = Application {
         services: vec![Service {
@@ -252,6 +252,7 @@ async fn serve_on_adapter(
         local_name(&agent)
     );
     loop {
+        let mut peer = None;
         let attempt = tokio::time::timeout(EXCHANGE_WAIT, async {
             let mut reader: Option<CharacteristicReader> = None;
             let mut writer: Option<CharacteristicWriter> = None;
@@ -259,13 +260,19 @@ async fn serve_on_adapter(
                 match control.next().await {
                     Some(CharacteristicControlEvent::Write(request)) => {
                         let next = request.accept()?;
-                        if writer.as_ref().is_some_and(|w| w.device_address() != next.device_address()) {
+                        if writer
+                            .as_ref()
+                            .is_some_and(|w| w.device_address() != next.device_address())
+                        {
                             writer = None;
                         }
                         reader = Some(next);
                     }
                     Some(CharacteristicControlEvent::Notify(next)) => {
-                        if reader.as_ref().is_some_and(|r| r.device_address() != next.device_address()) {
+                        if reader
+                            .as_ref()
+                            .is_some_and(|r| r.device_address() != next.device_address())
+                        {
                             reader = None;
                         }
                         writer = Some(next);
@@ -275,6 +282,7 @@ async fn serve_on_adapter(
             }
             let mut reader = reader.unwrap();
             let mut writer = writer.unwrap();
+            peer = Some(reader.device_address());
             let mut random = [0u8; 32];
             getrandom::getrandom(&mut random).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
             let secret = StaticSecret::from(random);
@@ -318,6 +326,9 @@ async fn serve_on_adapter(
             Ok::<(), anyhow::Error>(())
         })
         .await;
+        if let Some(address) = peer {
+            let _ = adapter.remove_device(address).await;
+        }
         match attempt {
             Ok(Ok(())) => break,
             Ok(Err(error)) => eprintln!("egdod: refused BLE provisioning attempt: {error:#}"),
@@ -357,6 +368,7 @@ pub async fn provision(
     let expected_name = local_name(&expected_agent);
     let (adapter, was_powered) = adapter().await?;
     let result = async {
+        let known_devices = adapter.device_addresses().await?;
         let mut events = adapter.discover_devices_with_changes().await?;
         let device = tokio::time::timeout(SCAN_WAIT, async {
             while let Some(event) = events.next().await {
@@ -372,6 +384,7 @@ pub async fn provision(
         })
         .await
         .context("waiting for the requested BLE target")??;
+        let was_known = known_devices.contains(&device.address());
         drop(events);
         device.connect().await.context("connecting to BLE target")?;
         let exchange = tokio::time::timeout(EXCHANGE_WAIT, async {
@@ -421,6 +434,9 @@ pub async fn provision(
         .context("BLE provisioning exchange timed out")
         .and_then(|result| result);
         let _ = device.disconnect().await;
+        if !was_known {
+            let _ = adapter.remove_device(device.address()).await;
+        }
         exchange
     }
     .await;
@@ -456,13 +472,18 @@ mod tests {
         );
         let signature = controller.sign(&message);
         controller.public().verify(&message, &signature).unwrap();
-        let changed = identity_message(
-            CLIENT_LABEL,
-            &controller.public(),
-            &agent.public(),
-            &[server_key, [5; 32]],
-        );
-        assert!(controller.public().verify(&changed, &signature).is_err());
+        assert_eq!(message.len(), CLIENT_LABEL.len() + 128);
+        for offset in [
+            0,
+            CLIENT_LABEL.len(),
+            CLIENT_LABEL.len() + 32,
+            CLIENT_LABEL.len() + 64,
+            CLIENT_LABEL.len() + 96,
+        ] {
+            let mut changed = message.clone();
+            changed[offset] ^= 1;
+            assert!(controller.public().verify(&changed, &signature).is_err());
+        }
     }
 
     #[test]
@@ -474,15 +495,30 @@ mod tests {
             String::from_utf8(decrypt(&key, 0, b"transcript", &cipher).unwrap()).unwrap(),
             "network={\n\tssid=\"lab\"\n\tpsk=\"correct horse\"\n\tkey_mgmt=WPA-PSK\n}\n"
         );
+        assert!(decrypt(&key, 0, b"other transcript", &cipher).is_err());
         let mut corrupt = cipher;
         corrupt[0] ^= 1;
         assert!(decrypt(&key, 0, b"transcript", &corrupt).is_err());
         assert!(network_conf("x\nnetwork={", "12345678").is_err());
+        assert!(network_conf("lab", "1234567\n").is_err());
+        assert!(network_conf("lab", &"g".repeat(64)).is_err());
+        assert!(network_conf("lab", &"a".repeat(63))
+            .unwrap()
+            .contains("psk=\""));
+        assert!(network_conf("lab", &"ab".repeat(32))
+            .unwrap()
+            .contains("psk=abab"));
     }
 
     #[test]
     fn advertisement_name_is_derived_from_the_agent_node_id() {
         let id = SecretKey::from_bytes(&[9; 32]).public();
-        assert_eq!(local_name(&id), format!("egdod-{}", &id.to_string()[..8]));
+        let advertisement = advertisement(&id);
+        assert_eq!(
+            advertisement.local_name,
+            Some(format!("egdod-{}", &id.to_string()[..8]))
+        );
+        assert!(advertisement.service_uuids.contains(&SERVICE_UUID));
+        assert_eq!(advertisement.discoverable, Some(true));
     }
 }
