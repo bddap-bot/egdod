@@ -19,7 +19,9 @@ use chacha20poly1305::{
 use futures_lite::StreamExt;
 use iroh::{EndpointId, SecretKey, Signature};
 use sha2::{Digest, Sha256};
-use std::{collections::HashSet, os::unix::fs::OpenOptionsExt, path::Path, time::Duration};
+use std::{
+    collections::HashSet, os::unix::fs::OpenOptionsExt, path::Path, sync::Arc, time::Duration,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 
@@ -219,13 +221,14 @@ pub async fn serve(controller: EndpointId, key_file: &Path, output: &Path) -> Re
     let key = crate::state::load_or_create_key(key_file, crate::state::OnUnusable::Replace)?;
     let agent = key.public();
     let (adapter, was_powered) = adapter().await?;
+    let active = Arc::new(tokio::sync::Mutex::new(None));
     let result = tokio::select! {
-        result = serve_on_adapter(&adapter, controller, key, agent, output) => result,
-        result = termination() => {
-            result?;
-            bail!("BLE provisioning interrupted")
-        }
+        result = serve_on_adapter(&adapter, controller, key, agent, output, &active) => result,
+        result = termination() => result.and_then(|()| Err(anyhow::anyhow!("BLE provisioning interrupted"))),
     };
+    if let Some(peer) = active.lock().await.take() {
+        let _ = adapter.remove_device(peer).await;
+    }
     if !was_powered {
         let _ = adapter.set_powered(false).await;
     }
@@ -246,6 +249,7 @@ async fn serve_on_adapter(
     key: SecretKey,
     agent: EndpointId,
     output: &Path,
+    active: &tokio::sync::Mutex<Option<bluer::Address>>,
 ) -> Result<()> {
     let adv = adapter.advertise(advertisement(&agent)).await?;
     let (mut control, handle) = characteristic_control();
@@ -292,6 +296,7 @@ async fn serve_on_adapter(
             }
             None => bail!("BLE GATT service stopped"),
         };
+        *active.lock().await = Some(peer);
         let paired = tokio::time::timeout(CHANNEL_WAIT, async {
             while reader.is_none() || writer.is_none() {
                 match control.next().await {
@@ -318,6 +323,7 @@ async fn serve_on_adapter(
         .await;
         if let Err(error) = paired.context("BLE characteristic pairing timed out").and_then(|r| r) {
             let _ = adapter.remove_device(peer).await;
+            *active.lock().await = None;
             eprintln!("egdod: refused BLE provisioning attempt: {error:#}");
             continue;
         }
@@ -377,6 +383,7 @@ async fn serve_on_adapter(
         })
         .await;
         let _ = adapter.remove_device(peer).await;
+        *active.lock().await = None;
         match attempt {
             Ok(Ok(())) => break,
             Ok(Err(error)) => eprintln!("egdod: refused BLE provisioning attempt: {error:#}"),
@@ -416,6 +423,8 @@ pub async fn provision(
     let conf = network_conf(&ssid, &psk)?;
     let expected_name = local_name(&expected_agent);
     let (adapter, was_powered) = adapter().await?;
+    let active = Arc::new(tokio::sync::Mutex::new(None));
+    let active_during_provisioning = active.clone();
     let provisioning = async {
         let known_devices = adapter.device_addresses().await?;
         let mut events = adapter.discover_devices_with_changes().await?;
@@ -442,6 +451,7 @@ pub async fn provision(
             {
                 rejected.insert(address);
                 let was_known = known_devices.contains(&device.address());
+                *active_during_provisioning.lock().await = Some((device.clone(), was_known));
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
                     bail!("waiting for the requested BLE target timed out");
@@ -512,6 +522,7 @@ pub async fn provision(
                 if !was_known {
                     let _ = adapter.remove_device(device.address()).await;
                 }
+                *active_during_provisioning.lock().await = None;
                 match attempt {
                     Ok(()) => return Ok::<(), anyhow::Error>(()),
                     Err(error) => eprintln!("egdod: rejected BLE candidate {address}: {error:#}"),
@@ -521,11 +532,14 @@ pub async fn provision(
     };
     let result = tokio::select! {
         result = provisioning => result,
-        result = termination() => {
-            result?;
-            bail!("BLE provisioning interrupted")
-        }
+        result = termination() => result.and_then(|()| Err(anyhow::anyhow!("BLE provisioning interrupted"))),
     };
+    if let Some((device, was_known)) = active.lock().await.take() {
+        let _ = device.disconnect().await;
+        if !was_known {
+            let _ = adapter.remove_device(device.address()).await;
+        }
+    }
     if !was_powered {
         let _ = adapter.set_powered(false).await;
     }
