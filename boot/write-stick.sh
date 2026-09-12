@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
+HERE=$(dirname "$(readlink -f "$0")")
 
-if [ $# -ne 2 ]; then
-  echo "usage: write-stick.sh <esp-image> <device-by-id-path>" >&2
-  echo "  writes ONLY to the block device the by-id path resolves to, and only" >&2
-  echo "  if it is an unmounted ~30G USB disk; refuses everything else." >&2
+if [ $# -lt 2 ]; then
+  echo "usage: write-stick.sh <esp-image> <device-by-id-path> [--no-host] [--network SSID PSK]..." >&2
+  echo "  bakes the wireless networks the stick may join (networks.sh) into the image, then" >&2
+  echo "  writes ONLY to the block device the by-id path resolves to, and only if it is an" >&2
+  echo "  unmounted ~30G USB disk; refuses everything else." >&2
   exit 2
 fi
-IMG=$1
+SRC=$(readlink -f "$1")
 BYID=$2
+shift 2
 
-[ -f "$IMG" ] || { echo "refuse: no image at $IMG" >&2; exit 1; }
+[ -f "$SRC" ] || { echo "refuse: no image at $SRC" >&2; exit 1; }
 DEV=$(readlink -f "$BYID" 2>/dev/null || true)
 [ -n "$DEV" ] && [ -b "$DEV" ] || { echo "refuse: $BYID does not resolve to a block device" >&2; exit 1; }
 NAME=$(basename "$DEV")
@@ -28,6 +31,14 @@ case "$SIZE" in 29.9G|30G|29.8G) ;; *) echo "refuse: $DEV is $SIZE, not the expe
 case "$NAME" in
   sda*|sdb*|nvme*|zram*|dm-*) echo "refuse: $NAME is a system/data device by name" >&2; exit 1;;
 esac
+
+T=$(mktemp -d "${TMPDIR:-/tmp}/egdod-stick.XXXXXX")
+trap 'rm -rf "$T"' EXIT
+mkdir "$T/overlay"
+"$HERE/networks.sh" "$@" > "$T/overlay/wpa_supplicant.conf"
+[ -s "$T/overlay/wpa_supplicant.conf" ] || rm "$T/overlay/wpa_supplicant.conf"
+"$HERE/bake.sh" "$SRC" "$T/esp.img" "$T/overlay"
+IMG=$T/esp.img
 
 ISZ=$(stat -c%s "$IMG")
 echo "writing $ISZ bytes of $IMG to $DEV"

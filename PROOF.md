@@ -611,6 +611,46 @@ Which drivers were *exercised*: `e1000`, `e1000e`, `virtio_net` (this section),
 kernel; "covers" is an inference about the machine in front of you, "exercised"
 is what was watched.
 
+### No cable: a baked network
+
+Both were watched under qemu with `mac80211_hwsim`, three virtual radios in one
+VM: one stays with the target, the other two are moved into a network namespace
+where a rig — an overlay `/init` that prepares the namespace, then `exec`s the
+stick's own `init` — plays the other side. The target's `init` is the product
+binary from the image, unchanged; the rig only supplies what a second machine
+would: a radio hosting a network with DHCP, and a controller. The VM has no
+wired device at all (`-nic none`).
+
+**Station on a baked network** (`EGDOD_BOOT_LINK=station`). The rig hosts
+`egdod-proof` on its first radio and serves DHCP on it; `boot/networks.sh
+--no-host --network egdod-proof …` produced the same `wpa_supplicant.conf`
+`write-stick.sh` would bake, and `boot/bake.sh` appended it to the image's
+initrd the way `write-stick.sh` does. On the serial console:
+
+```
+RIG: hwsim radios: phy0 phy1 phy2; phy0 stays with the target, the rest go to the rig's netns
+init: 0 wired device(s), waiting up to 10s for a carrier
+RIG: netns radios: ap=wlan1 join=wlan2
+RIG: hostapd: wlan1: AP-ENABLED  
+RIG: proof network egdod-proof up on wlan1, controller serving on 0.0.0.0:52847
+init: wlan0 scanning for a baked network, up to 30s
+wlan0: CTRL-EVENT-CONNECTED - Connection to 02:00:00:00:01:00 completed [id=0 id_str=]
+init: link station wlan0
+udhcpc: lease of 10.99.0.10 obtained from 10.99.0.1, lease time 864000
+init: egdod PID 1 up, launching agent
+agent pubkey: db5016fcf9850b99d7e4f9ebc6d8ae060bde8e353b5932454bba45639d84e0b1
+egdod::agent: connected to controller via direct-lan (10.99.0.1:52847)
+RIG: agent pending over the baked network: db5016fcf9850b99d7e4f9ebc6d8ae060bde8e353b5932454bba45639d84e0b1
+RIG: unapproved exec refused
+egdod::agent: connected to controller via direct-lan (10.99.0.1:52847)
+RIG: exec as root over the baked network: uid 0
+RIG: target addresses: lo 127.0.0.1/8 wlan0 10.99.0.10/24 
+RIG: station OK
+```
+
+The access point the target hosts when nothing is baked is the next increment.
+The serial log is the artifact `boot-station-serial.log`.
+
 ## What the agent needs from its environment
 
 `SPEC.md` property 4 asks for this to be written down here, and made explicit on
@@ -671,6 +711,13 @@ anything specified:
   the agent runs as PID 1, and the switch_root handoff works (see PROVED above),
   but a laptop's own firmware is not OVMF. The stick is written; the boot on a
   physical Secure-Boot machine is the outstanding test.
+- **A real radio.** Every wireless proof ran on `mac80211_hwsim`, whose driver
+  needs no firmware and whose radios never lose each other. Whether a laptop's
+  Intel, Realtek or Broadcom chip comes up from the firmware set, associates,
+  and holds an access point is unwatched; the physical stick settles it.
+- **Baking from a host's own profile.** `networks.sh` was exercised only with
+  `--no-host --network …`; the NetworkManager and wpa_supplicant readers have
+  not run against a live profile.
 - **aarch64, and the phone.** Property 6 constrains the design — all state under
   one `--state-dir`, `pending --json`, `status --json`, no root, no systemd, no
   fixed paths — and the design respects it, but nothing was built or run on
@@ -692,6 +739,11 @@ anything specified:
 Beliefs with reasons and no observation behind them. Each is a candidate for the
 next round of proving.
 
+- **The firmware set covers the radios it names.** `PROOF.md` lists the drivers
+  exercised (`e1000`, `e1000e`, `virtio_net`, `mac80211_hwsim`); every other
+  driver in the tree is present and its firmware alongside, and the kernel's
+  in-place xz firmware load is a documented path, but no such driver has been
+  watched requesting a blob from this initramfs.
 - **exec's drain behaves under a genuinely slow controller.** The three shapes
   that matter were measured (see PROVED above), but all of them on loopback. The
   case the drain is really designed for — a controller reading slowly enough

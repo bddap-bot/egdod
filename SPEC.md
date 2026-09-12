@@ -69,6 +69,7 @@ egdod controller exec <agent> -- <argv...>
 egdod controller push <agent> <local-path> <remote-path>
 egdod controller pull <agent> <remote-path> <local-path>
 egdod controller forward <agent> <local-port> <remote-addr:port>
+| --hostapd <dev> | --supplicant]
 egdod agent --controller <nodeid> [--relay <url> | --no-relay] [--direct <addr:port>]
 ```
 
@@ -99,10 +100,32 @@ to drop a driver, a firmware blob, or a module tree; `PROOF.md` records what the
 fact, not as a cost to reduce. `egdod.mods=` on the command line names only what a modalias cannot
 express (`efivarfs`).
 
+## Getting onto a network: wired, baked station
+
+v0 assumed a cable. The stick now brings one link up, in this order, with one code path
+(`boot/init.c`), and dials exactly the same way over whichever it gets:
+
+1. **Wired.** Every non-wireless device is brought up; the first with a carrier within a bounded
+   wait (10 s) is configured — static if the command line carries `egdod.ip=`, DHCP otherwise.
+2. **Station on a baked network.** `boot/write-stick.sh` bakes a `wpa_supplicant.conf` into the
+   initramfs at write time (`boot/networks.sh`: the writing host's active wireless profile, plus
+   any `--network SSID PSK`, several allowed). With no wired carrier, the wireless device joins the
+   first baked network in range (30 s bound), takes DHCP, and dials as over Ethernet. The
+   credentials sit on the stick in plaintext, the same trade an installer stick with a preseed makes.
+3. **Derived access point.** With no wired carrier and no baked network in range, the target hosts
+   an access point itself and the controller comes to it: the next increment.
+
+Wireless needs the vendor firmware the kernel would otherwise fetch from a distro: the image carries
+Debian's non-free set for Intel, Atheros, Realtek, Broadcom, MediaTek and Marvell Libertas radios
+(`boot/image.nix`, pinned by hash like the kernel), the wireless and Ethernet driver modules with
+their dependencies, and loads drivers by modalias at boot. A USB Ethernet or wireless dongle whose
+driver and firmware are in that set is the zero-code fallback for a machine whose built-in radio is
+not.
+
 ## Explicit non-goals for v0
 
-No OS installer, no disko or partitioning, no image building, no Secure Boot work, no BLE, no
-target-hosted wifi AP, no web UI. Those are later increments and adding them will not earn credit.
+No OS installer, no disko or partitioning, no BLE, no web UI. Image building, Secure Boot and the
+target-hosted access point were later increments and are now in (see above and `boot/`).
 No Android packaging either — property 6 constrains the design, it is not a v0 deliverable.
 
 ## Deliverables

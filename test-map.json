@@ -32,12 +32,14 @@
     },
     {
       "paths": [
-        "boot/run-boot.sh"
+        "boot/run-boot.sh",
+        "boot/rig.sh"
       ],
       "tests": [
-        "bash -n boot/run-boot.sh"
+        "bash -n boot/run-boot.sh",
+        "bash -n boot/rig.sh"
       ],
-      "why": "the qemu/OVMF Secure-Boot boot harness — a full run needs OVMF firmware, KVM, a controller and a booted VM, so the gate checks syntax only; run `bash boot/run-boot.sh` manually (EGDOD_BOOT_NIC, EGDOD_BOOT_RELAY=1) to exercise it"
+      "why": "the qemu/OVMF Secure-Boot boot harness and the in-VM hwsim rig it bakes in — a full run needs OVMF firmware, KVM and a booted VM, so the gate checks syntax only; run `bash boot/run-boot.sh` (EGDOD_BOOT_LINK=wired|station|ap) manually to exercise them"
     },
     {
       "paths": [
@@ -50,12 +52,16 @@
     },
     {
       "paths": [
-        "boot/write-stick.sh"
+        "boot/write-stick.sh",
+        "boot/networks.sh",
+        "boot/bake.sh"
       ],
       "tests": [
-        "bash -n boot/write-stick.sh"
+        "bash -n boot/write-stick.sh",
+        "bash -n boot/networks.sh",
+        "bash -n boot/bake.sh"
       ],
-      "why": "the guarded physical-stick writer — it writes a real block device and demands an unmounted ~30G USB disk, so the gate checks syntax only"
+      "why": "the guarded physical-stick writer and the two steps it composes — networks.sh reads the writing host's wireless profile as root, write-stick.sh writes a real block device — so the gate checks syntax only; bake.sh is exercised by every run-boot.sh link proof"
     },
     {
       "paths": [
