@@ -370,13 +370,6 @@ static int bluetooth(void) {
     char *idw = dup_word(id);
     char *av[] = { "/egdod", "ble", "--controller", idw, "--key-file", "/agent.key", "--output", NETWORKS, NULL };
     up.daemon = spawn(av);
-    sleep(2);
-    if (waitpid(up.daemon, NULL, WNOHANG) == up.daemon) {
-        up.daemon = -1;
-        stop(&up.bluetoothd);
-        stop(&up.dbus);
-        return 0;
-    }
     if (stat(NETWORKS, &up.networks)) memset(&up.networks, 0, sizeof up.networks);
     printf("init: link BLE first hop; waiting for network credentials\n");
     return 1;

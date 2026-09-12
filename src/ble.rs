@@ -266,30 +266,37 @@ async fn serve_on_adapter(
         local_name(&agent)
     );
     loop {
-        let mut peer = None;
+        let (mut reader, mut writer, peer) = match control.next().await {
+            Some(CharacteristicControlEvent::Write(request)) => {
+                let reader = request.accept()?;
+                let peer = reader.device_address();
+                (Some(reader), None, peer)
+            }
+            Some(CharacteristicControlEvent::Notify(writer)) => {
+                let peer = writer.device_address();
+                (None, Some(writer), peer)
+            }
+            None => bail!("BLE GATT service stopped"),
+        };
         let mut installed = false;
         let attempt = tokio::time::timeout(EXCHANGE_WAIT, async {
-            let mut reader: Option<CharacteristicReader> = None;
-            let mut writer: Option<CharacteristicWriter> = None;
             while reader.is_none() || writer.is_none() {
                 match control.next().await {
                     Some(CharacteristicControlEvent::Write(request)) => {
                         let next = request.accept()?;
                         let address = next.device_address();
-                        if peer.is_some_and(|peer| peer != address) {
+                        if peer != address {
                             let _ = adapter.remove_device(address).await;
                             continue;
                         }
-                        peer = Some(address);
                         reader = Some(next);
                     }
                     Some(CharacteristicControlEvent::Notify(next)) => {
                         let address = next.device_address();
-                        if peer.is_some_and(|peer| peer != address) {
+                        if peer != address {
                             let _ = adapter.remove_device(address).await;
                             continue;
                         }
-                        peer = Some(address);
                         writer = Some(next);
                     }
                     None => bail!("BLE GATT service stopped"),
@@ -348,9 +355,7 @@ async fn serve_on_adapter(
             Ok::<(), anyhow::Error>(())
         })
         .await;
-        if let Some(address) = peer {
-            let _ = adapter.remove_device(address).await;
-        }
+        let _ = adapter.remove_device(peer).await;
         match attempt {
             Ok(Ok(())) => break,
             Ok(Err(error)) => eprintln!("egdod: refused BLE provisioning attempt: {error:#}"),
