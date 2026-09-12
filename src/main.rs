@@ -5,7 +5,7 @@ use egdod::controller::{self, ServeConfig};
 use egdod::net::RelayChoice;
 use egdod::proto::parse_pubkey;
 use egdod::state::StateDir;
-use egdod::{agent, ssh};
+use egdod::{agent, link, ssh};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -30,6 +30,19 @@ enum Role {
     },
     /// Runs on the target. Dials out forever; never listens.
     Agent(AgentArgs),
+    /// The access point a target hosts when no network will have it, derived
+    /// from a controller node id: SSID, PSK, addresses and port.
+    Link {
+        node_id: String,
+        #[arg(long)]
+        json: bool,
+        /// Print a hostapd.conf for this interface instead.
+        #[arg(long, conflicts_with_all = ["json", "supplicant"])]
+        hostapd: Option<String>,
+        /// Print the wpa_supplicant.conf a controller joins with instead.
+        #[arg(long, conflicts_with = "json")]
+        supplicant: bool,
+    },
 }
 
 #[derive(Args)]
@@ -82,6 +95,15 @@ enum ControllerCmd {
     },
     /// Approve an agent by public key. Scriptable, and it survives a restart.
     Approve { pubkey: String },
+    /// Join the access point a target hosts for this controller (see `egdod link`)
+    /// and hold it; serve keeps running as usual and the target dials in over it.
+    Join {
+        /// The wireless interface to join with; without it, only print the derivation.
+        #[arg(long)]
+        iface: Option<String>,
+        #[arg(long, conflicts_with = "iface")]
+        json: bool,
+    },
     /// The controller's own view of itself, including whether it is dialable.
     Status {
         #[arg(long)]
@@ -177,6 +199,16 @@ async fn main() -> Result<()> {
             let state = StateDir::new(state_dir.unwrap_or_else(StateDir::default_path));
             run_controller(state, cmd).await
         }
+        Role::Link { node_id, json, hostapd, supplicant } => {
+            let id = parse_pubkey(&node_id).context("node id")?;
+            let what = match (json, hostapd, supplicant) {
+                (_, Some(iface), _) => link::Show::Hostapd(iface),
+                (_, None, true) => link::Show::Supplicant,
+                (true, None, false) => link::Show::Json,
+                (false, None, false) => link::Show::Lines,
+            };
+            link::show(&id, what)
+        }
     }
 }
 
@@ -203,6 +235,11 @@ async fn run_controller(state: StateDir, cmd: ControllerCmd) -> Result<()> {
         }
         ControllerCmd::Pending { json } => controller::pending(&state, json),
         ControllerCmd::Approve { pubkey } => controller::approve(&state, &pubkey),
+        ControllerCmd::Join { iface: Some(iface), .. } => link::join(&state, &iface).await,
+        ControllerCmd::Join { iface: None, json } => {
+            let id = state.load_key()?.public();
+            link::show(&id, if json { link::Show::Json } else { link::Show::Lines })
+        }
         ControllerCmd::Status { json } => std::process::exit(controller::status(&state, json)?),
         ControllerCmd::Exec { agent, argv } => {
             let code = controller::exec(&state, &agent, argv).await?;

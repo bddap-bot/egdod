@@ -611,7 +611,7 @@ Which drivers were *exercised*: `e1000`, `e1000e`, `virtio_net` (this section),
 kernel; "covers" is an inference about the machine in front of you, "exercised"
 is what was watched.
 
-### No cable: a baked network
+### No cable: a baked network, and the access point the target hosts when there is none
 
 Both were watched under qemu with `mac80211_hwsim`, three virtual radios in one
 VM: one stays with the target, the other two are moved into a network namespace
@@ -648,8 +648,54 @@ RIG: target addresses: lo 127.0.0.1/8 wlan0 10.99.0.10/24
 RIG: station OK
 ```
 
-The access point the target hosts when nothing is baked is the next increment.
-The serial log is the artifact `boot-station-serial.log`.
+**The access point** (`EGDOD_BOOT_LINK=ap`). Nothing baked, so the target
+finds no wired carrier, no baked network in range, and hosts the derived access
+point. The rig's controller `join`s it (`egdod controller join --iface wlan2`,
+wpa_supplicant plus the derived link-local address), holds the agent pending,
+refuses an unapproved exec, approves, runs as root over the access point, and
+then `push`es a `wpa_supplicant.conf` for `egdod-proof` as the first approved
+command. The target's `init` sees the file land, tears the access point down,
+joins `egdod-proof` as a station, takes a lease, relaunches the agent with the
+image's dial settings, and the same approved key is served again — this time
+from a `10.99.0.0/24` address:
+
+```
+init: 0 wired device(s), waiting up to 10s for a carrier
+RIG: hostapd: wlan1: AP-ENABLED  
+RIG: proof network egdod-proof up on wlan1, controller serving on 0.0.0.0:49925
+wlan0: AP-ENABLED 
+init: link access-point egdod-294a8681 on wlan0 as 169.254.71.136; the controller dials in at 169.254.71.186:49925
+init: egdod PID 1 up, launching agent
+agent pubkey: 913f3646ec3343416928cc0959dc83163a70d06694e779268b9b177859d75dad
+wlan0: AP-STA-CONNECTED 02:00:00:00:02:00
+egdod::agent: connected to controller via direct-lan (169.254.71.186:49925)
+RIG: agent pending over the target's access point: 913f3646ec3343416928cc0959dc83163a70d06694e779268b9b177859d75dad
+RIG: unapproved exec refused
+egdod::agent: connected to controller via direct-lan (169.254.71.186:49925)
+RIG: exec as root over the target's access point: uid 0
+RIG: target addresses: lo 127.0.0.1/8 wlan0 169.254.71.136/16 
+RIG: join: egdod: joined egdod-294a8681 on wlan2 as 169.254.71.186/16; the target dials 169.254.71.186:49925. Ctrl-C to leave.
+RIG: pushing credentials for egdod-proof as the first approved command
+init: network credentials received over the access point
+init: 0 wired device(s), waiting up to 10s for a carrier
+init: wlan0 scanning for a baked network, up to 30s
+wlan0: CTRL-EVENT-CONNECTED - Connection to 02:00:00:00:01:00 completed [id=0 id_str=]
+init: link station wlan0
+udhcpc: lease of 10.99.0.10 obtained from 10.99.0.1, lease time 864000
+agent pubkey: 913f3646ec3343416928cc0959dc83163a70d06694e779268b9b177859d75dad
+egdod::agent: connected to controller via direct-lan (10.99.0.1:49925)
+RIG: exec as root over the credentialed network: uid 0
+RIG: target addresses: lo 127.0.0.1/8 wlan0 10.99.0.10/24 
+RIG: target holds a 10.99.0.0/24 lease: it left its access point for egdod-proof
+RIG: ap OK
+```
+
+The derivation the two sides agreed on is `egdod link <node-id>` (`SPEC.md`),
+pinned by `link::tests::known_vector` and checked by hand with `sha256sum` over
+the label and the raw id.
+
+Serial logs for both runs are the artifacts `boot-station-serial.log` and
+`boot-ap-serial.log`.
 
 ## What the agent needs from its environment
 
@@ -715,6 +761,11 @@ anything specified:
   needs no firmware and whose radios never lose each other. Whether a laptop's
   Intel, Realtek or Broadcom chip comes up from the firmware set, associates,
   and holds an access point is unwatched; the physical stick settles it.
+- **A controller that actually needs the derived access point.** In the proof
+  the controller's radio and the target's are two hwsim radios in one VM;
+  `egdod controller join` was exercised there, on a station with no other
+  network. A laptop losing its upstream when it joins the target — the reason
+  the access point is the fallback — is a design argument, not an observation.
 - **Baking from a host's own profile.** `networks.sh` was exercised only with
   `--no-host --network …`; the NetworkManager and wpa_supplicant readers have
   not run against a live profile.
@@ -744,6 +795,10 @@ next round of proving.
   driver in the tree is present and its firmware alongside, and the kernel's
   in-place xz firmware load is a documented path, but no such driver has been
   watched requesting a blob from this initramfs.
+- **The credential handoff on a real controller.** The proof pushed the file
+  from a controller on the same hwsim medium; over a real radio the access
+  point disappears under the controller the moment `init` acts, which is the
+  intended order (join, then serve the target's redial) and untested.
 - **exec's drain behaves under a genuinely slow controller.** The three shapes
   that matter were measured (see PROVED above), but all of them on loopback. The
   case the drain is really designed for — a controller reading slowly enough

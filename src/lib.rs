@@ -3,6 +3,7 @@
 
 pub mod agent;
 pub mod controller;
+pub mod link;
 pub mod net;
 pub mod pipe;
 pub mod proto;
