@@ -266,6 +266,7 @@ static int wait_wired(void) {
 }
 
 static int wired_ready(void) {
+    coldplug();
     DIR *d = opendir("/sys/class/net");
     if (!d) return 0;
     struct dirent *e;
@@ -577,8 +578,9 @@ int main(void) {
         } else if (lost_link) {
             printf("init: link daemon exited; bringing the link up again\n");
             relink(&agent, &av);
-        } else if ((up.kind == NONE || (up.kind == BLE && wired_ready())
-                    || (up.dev[0] && !carrier(up.dev))) && time(NULL) >= retry_at) {
+        } else if (time(NULL) >= retry_at
+                   && (up.kind == NONE || (up.kind == BLE && wired_ready())
+                       || (up.dev[0] && !carrier(up.dev)))) {
             printf("init: %s; bringing the link up again\n", up.kind == NONE ? "no link" : "carrier lost");
             relink(&agent, &av);
             retry_at = time(NULL) + RETRY_WAIT;
