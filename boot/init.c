@@ -265,40 +265,6 @@ static int wait_wired(void) {
     return 0;
 }
 
-static int wired_ready(void) {
-    coldplug();
-    DIR *d = opendir("/sys/class/net");
-    if (!d) return 0;
-    struct dirent *e;
-    int ready = 0;
-    while ((e = readdir(d))) {
-        if (e->d_name[0] == '.' || !strcmp(e->d_name, "lo")) continue;
-        if (is_wireless(e->d_name)) {
-            if (!wireless[0]) snprintf(wireless, sizeof wireless, "%s", e->d_name);
-            continue;
-        }
-        iface_up(e->d_name);
-        if (carrier(e->d_name)) { ready = 1; break; }
-    }
-    closedir(d);
-    return ready;
-}
-
-static int station_ready(void) {
-    if (!wireless[0] || access(NETWORKS, R_OK)) return 0;
-    iface_up(wireless);
-    char *av[] = { "/bin/wpa_supplicant", "-i", wireless, "-c", NETWORKS, NULL };
-    pid_t probe = spawn(av);
-    int ready = 0;
-    for (int t = 0; t < STATION_WAIT && probe > 0; t++) {
-        if (carrier(wireless)) { ready = 1; break; }
-        if (waitpid(probe, NULL, WNOHANG) == probe) { probe = -1; break; }
-        sleep(1);
-    }
-    stop(&probe);
-    return ready;
-}
-
 static int wait_carrier(int secs) {
     for (int t = 0; t < secs; t++) {
         if (carrier(up.dev)) return 1;
@@ -426,16 +392,45 @@ static void bring_down(void) {
     up.daemon = up.dhcp = up.dbus = up.bluetoothd = -1;
 }
 
+static void wired(void) {
+    up.kind = WIRED;
+    printf("init: link wired %s\n", up.dev);
+    const char *ip = arg("egdod.ip");
+    if (!ip) { dhcp(); return; }
+    set_addr(up.dev, dup_word(ip), arg("egdod.mask") ? dup_word(arg("egdod.mask")) : "255.255.255.0");
+    if (arg("egdod.gw")) default_route(up.dev, dup_word(arg("egdod.gw")));
+}
+
+static int promote_from_ble(void) {
+    pid_t helper = up.daemon;
+    up.daemon = -1;
+    coldplug();
+    if (wait_wired()) {
+        stop(&helper);
+        stop(&up.bluetoothd);
+        stop(&up.dbus);
+        wired();
+        return 1;
+    }
+    if (station()) {
+        stop(&helper);
+        stop(&up.bluetoothd);
+        stop(&up.dbus);
+        up.kind = STATION;
+        printf("init: link station %s\n", up.dev);
+        dhcp();
+        return 1;
+    }
+    up.dev[0] = 0;
+    up.daemon = helper;
+    return 0;
+}
+
 static void bring_up(void) {
     bring_down();
     coldplug();
     if (wait_wired()) {
-        up.kind = WIRED;
-        printf("init: link wired %s\n", up.dev);
-        const char *ip = arg("egdod.ip");
-        if (!ip) { dhcp(); return; }
-        set_addr(up.dev, dup_word(ip), arg("egdod.mask") ? dup_word(arg("egdod.mask")) : "255.255.255.0");
-        if (arg("egdod.gw")) default_route(up.dev, dup_word(arg("egdod.gw")));
+        wired();
         return;
     }
     if (station()) {
@@ -599,9 +594,10 @@ int main(void) {
             relink(&agent, &av);
         } else if (up.kind == BLE && time(NULL) >= retry_at) {
             retry_at = time(NULL) + RETRY_WAIT;
-            if (wired_ready() || station_ready()) {
+            if (promote_from_ble()) {
                 printf("init: a higher-priority link appeared; leaving BLE provisioning\n");
-                relink(&agent, &av);
+                av = agent_argv();
+                agent = spawn(av);
             }
         } else if (time(NULL) >= retry_at
                    && (up.kind == NONE || (up.dev[0] && !carrier(up.dev)))) {
