@@ -2,7 +2,7 @@
 
 What was observed, and what was not. Written fresh for the merged implementation
 on `main` — no claim here is inherited from `impl/kimi` or `impl/opus`.
-Everything below was run by the integrator on `bothouse` (NixOS, x86-64, glibc)
+Everything below was run by the integrator on the test host (NixOS, x86-64, glibc)
 on 2026-07-25, in the foreground, from this tree.
 
 Two rules govern this file. Anything under **PROVED** was seen happening and its
@@ -259,10 +259,10 @@ egdod: no host key on the target; generating one with ["ssh-keygen", "-q", "-t",
 egdod: no sshd answering; starting it with [".../openssh-10.4p1/bin/sshd", "-f", ...]
 egdod: sshd is up: SSH-2.0-OpenSSH_10.4
 egdod: known_hosts entry from the authenticated channel: [127.0.0.1]:43229 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBmSWK/Z4npqMI7tt4azR15KTk0VR8qcnxZj4R9mRfsA
-bothouse
+[hostname omitted]
 ```
 
-`bothouse` is `hostname` run over that ssh session, under
+The omitted hostname was returned over that ssh session, under
 `-o StrictHostKeyChecking=yes -o BatchMode=yes -o IdentitiesOnly=yes` with a
 private `UserKnownHostsFile`. It could not have prompted, and it could not have
 succeeded via the user's own keys or known_hosts.
@@ -746,11 +746,9 @@ anything specified:
 
 ### Not tested at all
 
-- **Two machines.** Both ends of every session above were on `bothouse`. NAT
+- **Two machines.** Both ends of every session above were on one host. NAT
   traversal between genuinely separate networks — the property the whole design
-  exists for — is untested here. The prior art (`bddap/bothouse`,
-  `hatch/RESULTS.md`) measured it working over this transport; this codebase has
-  not.
+  exists for — is untested here.
 - **`direct-wan`.** Three of the four labels were produced. A direct
   internet-routed path needs two hosts.
 - **A boot on real hardware.** The image boots under OVMF with Secure Boot on,
