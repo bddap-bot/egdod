@@ -204,15 +204,6 @@ No Android packaging either — property 6 constrains the design, it is not a v0
 - No `unsafe` without a comment justifying it.
 - Comments explain **why**, never what the signature already says.
 
-## Prior art you should read
-
-`bddap/bothouse` contains a working proof of the hard part: `deck-control/src/bin/iroh-tunnel.rs`
-implements dial/expose roles over iroh, and `hatch/RESULTS.md` records the measured result — an
-outbound-only-NAT guest dialing a baked NodeId over a public relay, the controller opening streams
-back to the guest's sshd, ssh exec plus file copy both directions, host keys delivered in band, and
-throughput of roughly 3–4 MB/s through a public relay. Read both. Reusing that proven approach is
-encouraged and is *not* what "no peeking" refers to.
-
 ## No peeking
 
 A second implementation of this same spec is being written independently, on another branch. Do not
