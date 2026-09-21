@@ -10,6 +10,9 @@ output is reproduced. Anything under **INFERRED** is a belief with a stated
 reason and no observation behind it. An unlabelled inference is a defect, and
 this repo has paid for that twice.
 
+Transcript addresses use the RFC 5737 documentation address `192.0.2.1` in
+place of the test host's LAN address; path labels retain the observed values.
+
 ## How to reproduce
 
 ```
@@ -279,11 +282,11 @@ this host's LAN address; sshd refuses it (egdod#7):
 ```
 target authorized_keys after two runs of the recipe:
 from="127.0.0.1,::1",expiry-time="202609012000Z" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOuR9rCaf7hKATaMTgX3VKcISnXPN9yjjaB7DiN6WWd1 egdod-controller
-from 192.168.1.141 with the same key: bot@127.0.0.1: Permission denied (publickey).
+from 192.0.2.1 with the same key: bot@127.0.0.1: Permission denied (publickey).
 ```
 
 sshd's side of that refusal, from the journal:
-`Authentication tried for bot with correct key but not from a permitted host (host=192.168.1.141, ip=192.168.1.141, required=127.0.0.1,::1)`.
+`Authentication tried for bot with correct key but not from a permitted host (host=192.0.2.1, ip=192.0.2.1, required=127.0.0.1,::1)`.
 The controls: the same connect without `from=` on the line succeeds, and a
 line whose `expiry-time` lies ten minutes in the past is refused with
 `entry expired`.
@@ -325,7 +328,7 @@ An agent was then given the node id and *nothing else* — no relay URL, no
 address — and reached it:
 
 ```
-egdod: session with 2d3dce2b... via direct-lan (192.168.1.141:47072)
+egdod: session with 2d3dce2b... via direct-lan (192.0.2.1:47072)
 hello-from-a-node-id-alone
 ```
 
@@ -333,7 +336,7 @@ The labels themselves, from the target's own log:
 
 ```
 INFO egdod::agent: connected to controller path=relayed remote=https://usw1-1.relay.n0.iroh.link./
-INFO egdod::agent: path changed was=relayed now=direct-lan remote=192.168.1.141:36572
+INFO egdod::agent: path changed was=relayed now=direct-lan remote=192.0.2.1:36572
 ```
 
 The session started on the relay, said so, holepunched to a LAN-routed direct
@@ -495,7 +498,7 @@ agent pubkey: 033e2c67119981f7f51f1e9e040f6b356514cb26de46304903d7337b1a31d74d
 ...
 uid seen by exec: 0
 Linux (none) 6.12.96+deb13-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.12.96-1 x86_64 GNU/Linux
-egdod: session with 033e2c67... via direct-lan (192.168.1.141:58356)
+egdod: session with 033e2c67... via direct-lan (192.0.2.1:58356)
 ```
 
 e1000 came up (statically, and separately by DHCP against qemu's own server —
