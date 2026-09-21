@@ -10,6 +10,9 @@ output is reproduced. Anything under **INFERRED** is a belief with a stated
 reason and no observation behind it. An unlabelled inference is a defect, and
 this repo has paid for that twice.
 
+Transcript addresses use the RFC 5737 documentation address `192.0.2.1` in
+place of the test host's LAN address; path labels retain the observed values.
+
 ## How to reproduce
 
 ```
