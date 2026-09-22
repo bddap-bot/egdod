@@ -71,7 +71,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 `cargo clippy --all-targets` emits nothing but its own progress:
 
 ```
-    Checking egdod v0.1.0 (/home/bot/.cache/botq-wt/3645)
+    Checking egdod v0.1.0 (<worktree>)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.29s
 ```
 
