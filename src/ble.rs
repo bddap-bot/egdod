@@ -245,14 +245,19 @@ async fn read_frame(reader: &mut CharacteristicReader) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-async fn adapter() -> Result<(Adapter, bool)> {
+async fn adapter(name: Option<&str>) -> Result<(Adapter, bool)> {
     let session = bluer::Session::new()
         .await
         .context("connecting to bluetoothd")?;
-    let adapter = session
-        .default_adapter()
-        .await
-        .context("finding a Bluetooth adapter")?;
+    let adapter = match name {
+        Some(name) => session
+            .adapter(name)
+            .with_context(|| format!("opening Bluetooth adapter {name}"))?,
+        None => session
+            .default_adapter()
+            .await
+            .context("finding a Bluetooth adapter")?,
+    };
     let powered = adapter.is_powered().await?;
     if !powered {
         adapter.set_powered(true).await?;
@@ -276,7 +281,7 @@ fn advertisement(id: &EndpointId) -> Advertisement {
 pub async fn serve(controller: EndpointId, key_file: &Path, output: &Path) -> Result<()> {
     let key = crate::state::load_or_create_key(key_file, crate::state::OnUnusable::Replace)?;
     let agent = key.public();
-    let (adapter, was_powered) = adapter().await?;
+    let (adapter, was_powered) = adapter(None).await?;
     let active = Arc::new(tokio::sync::Mutex::new(None));
     let result = tokio::select! {
         result = serve_on_adapter(&adapter, controller, key, agent, output, &active) => result,
@@ -458,10 +463,11 @@ pub async fn provision(
     expected_agent: EndpointId,
     ssid: String,
     psk: String,
+    adapter_name: Option<&str>,
 ) -> Result<()> {
     let conf = network_conf(&ssid, &psk)?;
     let expected_name = local_name(&expected_agent);
-    let (adapter, was_powered) = adapter().await?;
+    let (adapter, was_powered) = adapter(adapter_name).await?;
     let active = Arc::new(tokio::sync::Mutex::new(None));
     let active_during_provisioning = active.clone();
     let provisioning = async {

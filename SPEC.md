@@ -70,7 +70,7 @@ egdod controller push <agent> <local-path> <remote-path>
 egdod controller pull <agent> <remote-path> <local-path>
 egdod controller forward <agent> <local-port> <remote-addr:port>
 egdod controller join [--iface <dev>]           # join the access point a target hosts for this key
-egdod controller ble <agent> --network <ssid> --psk-file <path>
+egdod controller ble <agent> --network <ssid> --psk-file <path> [--adapter <hci>]
 egdod link <nodeid> [--json | --hostapd <dev> | --supplicant]
 egdod agent --controller <nodeid> [--relay <url> | --no-relay] [--direct <addr:port>]
 ```
