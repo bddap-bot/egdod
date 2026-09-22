@@ -13,12 +13,12 @@ HCI_ARGS=()
 cleanup() {
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
   [ -n "${BTMON_PID:-}" ] && { sudo kill "$BTMON_PID" 2>/dev/null || true; sleep 1; }
-  [ -n "${BOTQ_ARTIFACTS_DIR:-}" ] && [ -s "$WORK/btmon.txt" ] && cp "$WORK/btmon.txt" "$BOTQ_ARTIFACTS_DIR/boot-$MODE-btmon.txt"
+  [ -n "${EGDOD_BOOT_ARTIFACTS:-}" ] && [ -s "$WORK/btmon.txt" ] && cp "$WORK/btmon.txt" "$EGDOD_BOOT_ARTIFACTS/boot-$MODE-btmon.txt"
   [ -n "${BTVIRT_PID:-}" ] && { sleep 1; sudo kill "$BTVIRT_PID" 2>/dev/null || true; }
   [ -n "${BLE_ADDR:-}" ] && { sleep 1; sudo rm -rf "/var/lib/bluetooth/$BLE_ADDR"; }
   [ "${VHCI_ABSENT_BEFORE:-0}" = 1 ] && sudo modprobe -r hci_vhci 2>/dev/null || true
   [ -s "$SERIAL" ] && save_serial
-  [ -n "${BOTQ_ARTIFACTS_DIR:-}" ] && [ -s "$WORK/qemu.log" ] && cp "$WORK/qemu.log" "$BOTQ_ARTIFACTS_DIR/boot-$MODE-qemu.log"
+  [ -n "${EGDOD_BOOT_ARTIFACTS:-}" ] && [ -s "$WORK/qemu.log" ] && cp "$WORK/qemu.log" "$EGDOD_BOOT_ARTIFACTS/boot-$MODE-qemu.log"
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -26,9 +26,9 @@ trap cleanup EXIT
 say() { printf '\n=== %s\n' "$*"; }
 clean_serial() { sed 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\x1b[=>]//g' "$SERIAL" | tr -d '\r'; }
 save_serial() {
-  if [ -n "${BOTQ_ARTIFACTS_DIR:-}" ]; then
-    clean_serial > "$BOTQ_ARTIFACTS_DIR/boot-$MODE-serial.log"
-    echo "serial log saved to $BOTQ_ARTIFACTS_DIR/boot-$MODE-serial.log"
+  if [ -n "${EGDOD_BOOT_ARTIFACTS:-}" ]; then
+    clean_serial > "$EGDOD_BOOT_ARTIFACTS/boot-$MODE-serial.log"
+    echo "serial log saved to $EGDOD_BOOT_ARTIFACTS/boot-$MODE-serial.log"
   fi
 }
 
