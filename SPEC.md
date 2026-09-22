@@ -180,10 +180,19 @@ The PSK comes from a file rather than the process argument list.
 
 BlueZ supplies the radio and GATT implementation on both ends. The initramfs carries `bluetoothd`,
 the D-Bus daemon it uses and their pinned closures; the existing binary supplies the GATT target and
-controller subcommands. Those processes exist only while provisioning. The session agent remains
-the same static executable and has no Bluetooth, D-Bus or second lifecycle: possessing the BLE link
-grants no command, file or tunnel access, and approval by the agent's public key still gates all
-three primitives after the ordinary IP dial.
+controller subcommands (`--adapter` names the radio on a host with several). Those processes exist
+only while provisioning. The session agent remains the same static executable and has no
+Bluetooth, D-Bus or second lifecycle: possessing the BLE link grants no command, file or tunnel
+access, and approval by the agent's public key still gates all three primitives after the ordinary
+IP dial.
+
+The hop needs no pairing and leaves no bond. The target's `bluetoothd` runs LE-only
+(`boot/bluetooth.conf`, `ControllerMode = le`) and loads no plugin, the MIDI profile among them: LE-only puts "BR/EDR
+not supported" in its advertisement, so a dual-mode controller radio connects over LE rather than
+trying a classic link the target never answers; no MIDI profile means nothing on the target reads
+an encrypted characteristic and asks the controller to pair. A bond the controller's daemon holds
+for a target's address can only be stale — a fresh initramfs has no key to answer it with — so the
+controller refuses to connect through one and names the command that removes it.
 
 ## Explicit non-goals for v0
 

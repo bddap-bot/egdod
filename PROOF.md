@@ -21,6 +21,9 @@ nix-build musl.nix -o /tmp/egdod-musl-result                     # the static ag
 EGDOD_MUSL_BIN=/tmp/egdod-musl-result/bin/egdod nix-shell --run './demo.sh'
 bash boot/run-boot.sh                                            # boot under Secure Boot, end to end
 EGDOD_BOOT_DHCP=1 bash boot/run-boot.sh                          # same, bringing the link up by DHCP
+EGDOD_BOOT_LINK=station bash boot/run-boot.sh                    # no cable: a baked network, under hwsim
+EGDOD_BOOT_LINK=ap bash boot/run-boot.sh                         # no cable, nothing baked: the derived access point
+EGDOD_BOOT_LINK=ble bash boot/run-boot.sh                        # no radio at all: BLE first hop on an emulated air (sudo for the emulator)
 ```
 
 `demo.sh` steps 0-14 are hermetic. Steps 15-17 use n0's public relay and DNS.
@@ -700,6 +703,117 @@ the label and the raw id.
 Serial logs for both runs are the artifacts `boot-station-serial.log` and
 `boot-ap-serial.log`.
 
+### No radio but Bluetooth: the first hop over BLE, then the station path
+
+Watched under the same qemu/OVMF Secure-Boot harness (`EGDOD_BOOT_LINK=ble`).
+The VM has no wired device and, until credentials arrive, no wireless radio
+either: the rig moves all three hwsim radios into its namespace at boot. Its
+Bluetooth controller is a serial-line HCI. BlueZ's own controller emulator
+(`btvirt`, built from the pinned source by `boot/btvirt.nix`) creates one
+virtual controller for the test host's `bluetoothd` and one on a pseudo-terminal,
+which qemu hands to the guest as a virtio-serial port; the rig attaches it with
+`btattach -N -B /dev/hvc0 -P h4`. From there everything is the product: the
+initramfs `bluetoothd` from the image, `init`'s BLE branch, the image's static
+binary as the target and the host build as the controller. The emulator is the
+air both controllers share, so scans, connections and ATT traffic cross it as
+they would a link; its serial path accepted only HCI commands from the attached
+host and dropped ACL data, which `boot/btvirt-serial-acl.patch` fixes.
+
+The serial console, then the host, in the order it happened:
+
+```
+RIG: bluetooth: hci0 from the virtio-serial controller; hwsim radios: phy0 phy1 phy2, all in the rig's netns until credentials arrive
+init: 0 wired device(s), waiting up to 10s for a carrier
+init: link BLE first hop; waiting for network credentials
+init: egdod PID 1 up; provisioning before the IP agent starts
+egdod: BLE first hop 6318ce12e35f56784802e0f33913d60eedc986956c22bdef7e44ee7598e359c3 advertising egdod-6318ce12
+```
+
+A controller with a key the image does not name reaches the target first. The
+target refuses its identity proof and drops the link; the controller tries
+again each time the target reappears in its scan and gives up at the scan
+bound:
+
+```
+egdod: rejected BLE candidate 00:AA:01:01:00:42: verifying BLE target identity: Invalid signature
+egdod: rejected BLE candidate 00:AA:01:01:00:42: verifying BLE target identity: Invalid signature
+egdod: rejected BLE candidate 00:AA:01:01:00:42: verifying BLE target identity: Invalid signature
+egdod: rejected BLE candidate 00:AA:01:01:00:42: BLE provisioning exchange timed out: deadline has elapsed
+Error: waiting for the requested BLE target timed out
+```
+
+Each of those is `egdod: refused BLE provisioning attempt: early eof` on the
+target's console: the stranger disconnected once its check failed, before
+writing anything.
+
+The controller the image names pushes `egdod-proof`:
+
+```
+egdod: 6318ce12e35f56784802e0f33913d60eedc986956c22bdef7e44ee7598e359c3 accepted network credentials over BLE; waiting for its normal IP dial
+```
+
+The rig sees the file land and hands the target a radio; `init`'s retry finds
+the network the file names and leaves BLE for the station path:
+
+```
+RIG: credentials landed over BLE (mode 600); handing wlan1 to the target
+egdod: network credentials received over BLE
+init: wlan1 scanning for a baked network, up to 30s
+init: link station wlan1
+init: a higher-priority link appeared; leaving BLE provisioning
+agent pubkey: 6318ce12e35f56784802e0f33913d60eedc986956c22bdef7e44ee7598e359c3
+RIG: agent pending over the network received over BLE: 6318ce12e35f56784802e0f33913d60eedc986956c22bdef7e44ee7598e359c3
+RIG: unapproved exec refused
+RIG: exec as root over the network received over BLE: uid 0
+RIG: target addresses: lo 127.0.0.1/8 wlan1 10.99.0.10/24
+RIG: session path: routed a session agent=6318ce12e35f56784802e0f33913d60eedc986956c22bdef7e44ee7598e359c3 path=direct-lan remote=10.99.0.10:47797
+RIG: target holds a 10.99.0.0/24 lease on egdod-proof
+RIG: ble OK
+```
+
+`btmon` on the host's controller, the whole run:
+
+- every advertisement carries `Flags: 0x06 … BR/EDR Not Supported` and
+  `Name (complete): egdod-6318ce12`;
+- the stranger: three `LE Create Connection`s at 10.30 s, 28.74 s and
+  46.66 s, each with `Exchange MTU`, the start byte as a `Write Command len
+  3`, the target's hello as a `Handle Multiple Value Notification len 140`,
+  then `Disconnect Complete` once its signature check failed; its fourth pass
+  began with the scan bound already reached and made no connection;
+- the push: `LE Create Connection` at 86.59 s, the start byte, the frame
+  length (`Write Command len 6`), the 128-byte identity proof plus the sealed
+  file (`Write Command len 230`), the acknowledgement (`Notification len 30`),
+  `Disconnect Complete` at 89.09 s — the hop took two and a half seconds;
+- `SMP` lines in the capture: none. No pairing, no bond, no key on either side.
+
+Image with the BlueZ and D-Bus closures, from the run's `sizes.txt`: initrd
+604 MB, ESP 684 MB.
+
+`cargo test`: 33 + 1 green, among them `ble::tests::{advertisement_name_is_derived_from_the_agent_node_id,
+hello_has_one_exact_encoding, identity_proofs_bind_both_nodes_and_ephemeral_keys,
+verification_rejects_wrong_identity_proofs, credentials_are_authenticated_and_confined_to_network_syntax,
+install_is_private_atomic_and_cleans_up_failures, key_and_frame_boundaries_are_domain_separated}`.
+
+What this proof falsified on the way, each a run of the same harness that
+failed before the fix and passed after:
+
+- With `bluetoothd` in its default dual mode the target's advertisement lacked
+  the BR/EDR-not-supported flag, so the host's BlueZ chose a BR/EDR connection
+  to a target that listens only over LE and every exchange timed out.
+  `boot/bluetooth.conf` puts the initramfs daemon in `ControllerMode = le`;
+  the flag is in the capture above.
+- With BlueZ's MIDI profile loaded on both ends (a rehearsal of the exchange on
+  two emulated controllers under the test host's daemon), the peripheral's MIDI
+  client read the central's MIDI characteristic, was refused for insufficient
+  encryption and requested pairing. The bond that pairing stored for the
+  target's fixed address made the next boot of the same target fail with `PIN
+  or Key Missing`, and a refused pairing dropped the link outright. The
+  initramfs daemon loads no plugin, and a controller that finds a bond for the
+  target it was asked for stops and names the command that removes it rather
+  than connect through it.
+- The emulator's serial path dropped the guest's ACL packets: the guest's trace
+  showed the host's MTU request arriving and its own answer going nowhere.
+
 ## What the agent needs from its environment
 
 `SPEC.md` property 4 asks for this to be written down here, and made explicit on
@@ -762,6 +876,17 @@ anything specified:
   needs no firmware and whose radios never lose each other. Whether a laptop's
   Intel, Realtek or Broadcom chip comes up from the firmware set, associates,
   and holds an access point is unwatched; the physical stick settles it.
+- **A real Bluetooth radio, at either end.** The BLE proof's air is BlueZ's
+  emulator; the test host has one Bluetooth radio, in use for other devices, and no
+  second machine with one was reachable. Whether a combo chip comes up in
+  LE-only mode from the initramfs, advertises, and holds a connection to a
+  laptop's or phone's radio is unwatched, and so is the Bluetooth firmware set.
+- **A bonded target.** The failure the refusal prevents was watched (a bond
+  kept for a target's fixed address, then `PIN or Key Missing` on the next
+  boot); the refusal itself has not been seen to fire, because the LE-only,
+  plugin-free target never creates a bond to find.
+- **A controller asking for another target's id.** Unit-tested only: the name
+  filter never matches, so no connection is made; not watched on the air.
 - **A controller that actually needs the derived access point.** In the proof
   the controller's radio and the target's are two hwsim radios in one VM;
   `egdod controller join` was exercised there, on a station with no other
@@ -796,6 +921,11 @@ next round of proving.
   driver in the tree is present and its firmware alongside, and the kernel's
   in-place xz firmware load is a documented path, but no such driver has been
   watched requesting a blob from this initramfs.
+- **Any BlueZ controller host connects to the target over LE.** Watched with
+  the test host's BlueZ 5.86 and the emulator's dual-mode controller: the
+  BR/EDR-not-supported flag in the target's advertisement is what its bearer
+  selection keys on, read from `select_conn_bearer` in the pinned source. Other
+  versions are reasoned from the same code, not run.
 - **The credential handoff on a real controller.** The proof pushed the file
   from a controller on the same hwsim medium; over a real radio the access
   point disappears under the controller the moment `init` acts, which is the
