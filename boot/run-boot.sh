@@ -1,20 +1,24 @@
-    line=$(clean_serial 2>/dev/null | grep -aE "$pattern" | head -1 || true)
-    [ -n "$line" ] && { printf '%s\n' "$line"; return 0; }
-    kill -0 "$QEMU_PID" 2>/dev/null || { echo "qemu exited early" >&2; clean_serial | tail -40 >&2; return 1; }
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 MODE=${EGDOD_BOOT_LINK:-wired}
-case "$MODE" in wired|station|ap) ;; *) echo "EGDOD_BOOT_LINK must be wired, station or ap" >&2; exit 2;; esac
+case "$MODE" in wired|station|ap|ble) ;; *) echo "EGDOD_BOOT_LINK must be wired, station, ap or ble" >&2; exit 2;; esac
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/egdod-boot.XXXXXX")
 SERIAL=$WORK/serial.log
 STATE=$WORK/controller
 PIDS=()
+HCI_ARGS=()
 cleanup() {
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
+  [ -n "${BTMON_PID:-}" ] && { sudo kill "$BTMON_PID" 2>/dev/null || true; sleep 1; }
+  [ -n "${BOTQ_ARTIFACTS_DIR:-}" ] && [ -s "$WORK/btmon.txt" ] && cp "$WORK/btmon.txt" "$BOTQ_ARTIFACTS_DIR/boot-$MODE-btmon.txt"
+  [ -n "${BTVIRT_PID:-}" ] && { sleep 1; sudo kill "$BTVIRT_PID" 2>/dev/null || true; }
+  [ -n "${BLE_ADDR:-}" ] && { sleep 1; sudo rm -rf "/var/lib/bluetooth/$BLE_ADDR"; }
+  [ "${VHCI_ABSENT_BEFORE:-0}" = 1 ] && sudo modprobe -r hci_vhci 2>/dev/null || true
   [ -s "$SERIAL" ] && save_serial
+  [ -n "${BOTQ_ARTIFACTS_DIR:-}" ] && [ -s "$WORK/qemu.log" ] && cp "$WORK/qemu.log" "$BOTQ_ARTIFACTS_DIR/boot-$MODE-qemu.log"
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -61,6 +65,7 @@ boot() {
 start_vm() {
   cp "$VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
   : > "$SERIAL"
+  [ -n "${HCI_PTY:-}" ] && sudo chown "$(id -un)" "$HCI_PTY"
   say "booting under qemu/OVMF with Secure Boot ON"
   "$QEMU" \
     -machine q35,accel=kvm:tcg -cpu max -m 4096 \
@@ -68,7 +73,7 @@ start_vm() {
     -drive if=pflash,format=raw,file="$WORK/vars.fd" \
     -drive format=raw,file="$1",if=ide,snapshot=on \
     "${@:2}" \
-    -display none -vga none -serial "file:$SERIAL" -no-reboot >"$WORK/qemu.log" 2>&1 &
+    -display none -vga none -serial "file:$SERIAL" "${HCI_ARGS[@]}" -no-reboot >"$WORK/qemu.log" 2>&1 &
   QEMU_PID=$!
   PIDS+=("$QEMU_PID")
 }
@@ -82,6 +87,13 @@ wait_serial() {
     sleep 2
   done
   return 1
+}
+
+ble_defect() {
+  echo "DEFECT: $1" >&2
+  wait_serial "RIG: DEFECT" 150 >/dev/null || true
+  clean_serial | grep -a "^RIG" | tail -45 >&2
+  exit 1
 }
 
 if [ "$MODE" != wired ]; then
@@ -107,10 +119,60 @@ if [ "$MODE" != wired ]; then
     cp "$OV/rig/proof.conf" "$OV/wpa_supplicant.conf"
     echo "--- baked networks:"; cat "$OV/wpa_supplicant.conf"
   fi
+  if [ "$MODE" = ble ]; then
+    for tool in btattach btmon; do cp "$(nix-build --no-out-link nixpkgs.nix -A bluez)/bin/$tool" "$OV/bin/"; done
+  fi
   boot/bake.sh "$IMG/esp.img" "$WORK/esp.img" "$OV"
 
+  if [ "$MODE" = ble ]; then
+    say "a virtual Bluetooth air from BlueZ's emulator: one controller for this host's bluetoothd, one on a serial line for the VM"
+    VHCI_ABSENT_BEFORE=$(lsmod | grep -q "^hci_vhci " && echo 0 || echo 1)
+    sudo modprobe hci_vhci
+    controllers() { ls /sys/class/bluetooth 2>/dev/null | grep -E "^hci[0-9]+$" | sort || true; }
+    HCIS_BEFORE=$(controllers)
+    : >"$WORK/btvirt.log"
+    sudo stdbuf -oL "$(nix-build --no-out-link boot/btvirt.nix)/bin/btvirt" -S -L -l1 >"$WORK/btvirt.log" 2>&1 &
+    BTVIRT_PID=$!
+    for _ in $(seq 1 20); do
+      grep -q 'Pseudo terminal' "$WORK/btvirt.log" && [ "$(controllers)" != "$HCIS_BEFORE" ] && break
+      sleep 0.5
+    done
+    HCI_PTY=$(sed -n 's/^Pseudo terminal at //p' "$WORK/btvirt.log")
+    BLE_HCI=$(comm -13 <(echo "$HCIS_BEFORE") <(controllers) | head -1)
+    [ -n "$HCI_PTY" ] && [ -n "$BLE_HCI" ] || { echo "DEFECT: the emulator brought up no controller" >&2; cat "$WORK/btvirt.log" >&2; exit 1; }
+    case "$(readlink -f "/sys/class/bluetooth/$BLE_HCI")" in
+      /sys/devices/virtual/*) ;;
+      *) echo "DEFECT: $BLE_HCI is a physical controller, not the emulator's" >&2; exit 1;;
+    esac
+    BLE_ADDR=$(sudo btmgmt --index "${BLE_HCI#hci}" info | sed -n 's/^\s*addr \([0-9A-F:]*\) .*/\1/p')
+    echo "host controller $BLE_HCI ($BLE_ADDR); the VM's controller on $HCI_PTY"
+    HCI_ARGS=(-device virtio-serial-pci -chardev "serial,id=hci,path=$HCI_PTY" -device virtconsole,chardev=hci)
+  fi
+
   boot "$WORK/esp.img" -nic none
-  say "watching the rig (no wired device in this VM; two hwsim radios in the rig's netns, one with the target)"
+
+  if [ "$MODE" = ble ]; then
+    say "waiting for the target to advertise (it has no wired device and no radio but the serial-line Bluetooth controller)"
+    AID=$(wait_serial '^egdod: BLE first hop [0-9a-f]+ advertising' 150 | sed 's/^egdod: BLE first hop \([0-9a-f]*\) .*/\1/') \
+      || { echo "DEFECT: the target never advertised" >&2; clean_serial | tail -40 >&2; save_serial; exit 1; }
+    echo "target node id, read from its console: $AID"
+    sudo btmon -i "$BLE_HCI" -w "$WORK/btmon.snoop" >"$WORK/btmon.txt" 2>&1 &
+    BTMON_PID=$!
+    say "a stranger's controller reaches the target and is refused"
+    "$BIN" controller --state-dir "$WORK/stranger" init >/dev/null
+    if "$BIN" controller --state-dir "$WORK/stranger" ble "$AID" --network "$(cat "$OV/rig/proof-ssid")" \
+        --psk-file "$OV/rig/proof-psk" --adapter "$BLE_HCI" >"$WORK/stranger.log" 2>&1; then
+      ble_defect "a stranger provisioned the target"
+    fi
+    cat "$WORK/stranger.log"
+    grep -q 'verifying BLE target identity' "$WORK/stranger.log" \
+      || ble_defect "the stranger failed for a reason other than the target's identity proof"
+    say "the controller pushes $(cat "$OV/rig/proof-ssid") over BLE"
+    "$BIN" controller --state-dir "$STATE" ble "$AID" --network "$(cat "$OV/rig/proof-ssid")" \
+      --psk-file "$OV/rig/proof-psk" --adapter "$BLE_HCI" 2>&1 | tee "$WORK/push.log" || true
+    grep -q "accepted network credentials" "$WORK/push.log" || ble_defect "the push did not complete"
+  fi
+  say "watching the rig (no wired device in this VM; hwsim radios in the rig's netns, and the target's link as $MODE demands)"
   if ! wait_serial "RIG: ($MODE OK|DEFECT)" 150; then
     echo "DEFECT: the rig reached no verdict" >&2; clean_serial | tail -40 >&2; save_serial; exit 1
   fi

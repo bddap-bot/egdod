@@ -1,0 +1,28 @@
+--- a/emulator/serial.c
++++ b/emulator/serial.c
+@@ -101,6 +101,7 @@
+ 
+ 	while (count > 0) {
+ 		hci_command_hdr *cmd_hdr;
++		hci_acl_hdr *acl_hdr;
+ 
+ 		if (!serial->pkt_data) {
+ 			serial->pkt_type = ptr[0];
+@@ -117,6 +118,17 @@
+ 				serial->pkt_data = malloc(serial->pkt_expect);
+ 				serial->pkt_len = 0;
+ 				break;
++			case HCI_ACLDATA_PKT:
++				if (count < HCI_ACL_HDR_SIZE + 1) {
++					serial->pkt_offset += len;
++					return;
++				}
++				acl_hdr = (hci_acl_hdr *) (ptr + 1);
++				serial->pkt_expect = HCI_ACL_HDR_SIZE +
++						btohs(acl_hdr->dlen) + 1;
++				serial->pkt_data = malloc(serial->pkt_expect);
++				serial->pkt_len = 0;
++				break;
+ 			default:
+ 				printf("packet error\n");
+ 				return;
