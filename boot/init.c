@@ -384,18 +384,15 @@ static int bluetooth(void) {
     return 1;
 }
 
-static int networks_changed(void) {
-    struct stat st;
-    if (stat(NETWORKS, &st)) return 0;
-    return st.st_ino != up.networks.st_ino || st.st_mtim.tv_sec != up.networks.st_mtim.tv_sec
-        || st.st_mtim.tv_nsec != up.networks.st_mtim.tv_nsec;
-}
-
 static int networks_changed_from(struct stat before) {
     struct stat st;
     if (stat(NETWORKS, &st)) return 0;
     return st.st_ino != before.st_ino || st.st_mtim.tv_sec != before.st_mtim.tv_sec
         || st.st_mtim.tv_nsec != before.st_mtim.tv_nsec;
+}
+
+static int networks_changed(void) {
+    return networks_changed_from(up.networks);
 }
 
 static void bring_down(void) {
@@ -423,28 +420,32 @@ static void stop_bluetooth(pid_t *helper) {
     stop(&up.dbus);
 }
 
-static int promote_from_ble(void) {
-    pid_t helper = up.daemon;
-    struct stat before = up.networks;
-    up.daemon = -1;
-    coldplug();
+static int ip_link(void) {
     if (wait_wired()) {
-        stop_bluetooth(&helper);
         wired();
         return 1;
     }
     if (station()) {
-        stop_bluetooth(&helper);
         up.kind = STATION;
         printf("init: link station %s\n", up.dev);
         dhcp();
         return 1;
     }
     if (access_point()) {
-        stop_bluetooth(&helper);
         up.kind = AP;
-        if (networks_changed_from(before)) return 2;
         return 1;
+    }
+    return 0;
+}
+
+static int promote_from_ble(void) {
+    pid_t helper = up.daemon;
+    struct stat before = up.networks;
+    up.daemon = -1;
+    coldplug();
+    if (ip_link()) {
+        stop_bluetooth(&helper);
+        return up.kind == AP && networks_changed_from(before) ? 2 : 1;
     }
     if (up.dev[0]) set_addr(up.dev, "0.0.0.0", NULL);
     up.dev[0] = 0;
@@ -455,20 +456,7 @@ static int promote_from_ble(void) {
 static void bring_up(void) {
     bring_down();
     coldplug();
-    if (wait_wired()) {
-        wired();
-        return;
-    }
-    if (station()) {
-        up.kind = STATION;
-        printf("init: link station %s\n", up.dev);
-        dhcp();
-        return;
-    }
-    if (access_point()) {
-        up.kind = AP;
-        return;
-    }
+    if (ip_link()) return;
     if (bluetooth()) {
         up.kind = BLE;
         return;
