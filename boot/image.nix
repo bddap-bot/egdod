@@ -109,7 +109,7 @@ let
     buildPhase = ''
     set -euo pipefail
     x86_64-unknown-linux-musl-gcc -static -O2 -o init ${./init.c}
-    mkdir -p rootfs/bin rootfs/nix/store rootfs/etc/dbus-1
+    mkdir -p rootfs/bin rootfs/nix/store rootfs/etc/dbus-1 rootfs/etc/bluetooth
     cp init rootfs/init
     cp ${agent}/bin/egdod rootfs/egdod
     cp ${pkgs.pkgsStatic.busybox}/bin/busybox rootfs/bin/busybox
@@ -119,6 +119,7 @@ let
     ln -s ${pkgs.bluez}/bin/bluetoothd rootfs/bin/bluetoothd
     ln -s ${pkgs.dbus}/bin/dbus-daemon rootfs/bin/dbus-daemon
     cp ${./dbus-system.conf} rootfs/etc/dbus-1/system.conf
+    cp ${./bluetooth.conf} rootfs/etc/bluetooth/main.conf
     cp ${./passwd} rootfs/etc/passwd
     cp ${./group} rootfs/etc/group
     cp ${./udhcpc.script} rootfs/bin/udhcpc.script
