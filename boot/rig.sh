@@ -20,8 +20,20 @@ if [ "${1:-}" != ns ]; then
   done
   set -- $PHYS
   [ $# -ge 3 ] || { say "DEFECT: only $# hwsim radios came up"; exit 1; }
-  say "hwsim radios: $*; $1 stays with the target, the rest go to the rig's netns"
-  shift
+  if [ "$MODE" = ble ]; then
+    modprobe virtio_console
+    modprobe hci_uart
+    for _ in $(seq 1 20); do [ -e /dev/hvc0 ] && break; sleep 0.5; done
+    btattach -N -B /dev/hvc0 -P h4 > /rig/btattach.log 2>&1 &
+    for _ in $(seq 1 20); do [ -e /sys/class/bluetooth/hci0 ] && break; sleep 0.5; done
+    [ -e /sys/class/bluetooth/hci0 ] || { say "DEFECT: btattach brought up no controller: $(tr '\n' ' ' < /rig/btattach.log)"; exit 1; }
+    sleep 3
+    btmon -w /rig/btmon.snoop > /rig/btmon.txt 2>&1 &
+    say "bluetooth: $(ls /sys/class/bluetooth 2>/dev/null | tr '\n' ' ')from the virtio-serial controller$(dmesg | grep -a 'Bluetooth: hci' | tail -2 | sed 's/.*Bluetooth: /; /' | tr '\n' ' '); hwsim radios: $*, all in the rig's netns until credentials arrive"
+  else
+    say "hwsim radios: $*; $1 stays with the target, the rest go to the rig's netns"
+    shift
+  fi
   unshare -m -n sh /init ns &
   NS=$!
   for _ in $(seq 1 50); do [ -e /rig/ns-ready ] && break; sleep 0.1; done
@@ -93,12 +105,23 @@ prove_session() {
   say "session path: $(grep -a 'routed a session' /rig/serve.log | tail -1 | sed 's/.*egdod::controller: //')"
 }
 
-if [ "$MODE" = ap ]; then
-  ctl join --iface "$JOIN" > /rig/join.log 2>&1 &
-  LINK="the target's access point"
-else
-  LINK="the baked network"
-fi
+case "$MODE" in
+  ap)
+    ctl join --iface "$JOIN" > /rig/join.log 2>&1 &
+    LINK="the target's access point";;
+  ble)
+    for _ in $(seq 1 200); do [ -s /wpa_supplicant.conf ] && break; sleep 1; done
+    [ -s /wpa_supplicant.conf ] || {
+      say "DEFECT: no credentials arrived over BLE"
+      grep -aE 'Connection Complete|Disconnect|Reason:|ATT: |SMP: |L2CAP|Status:' /rig/btmon.txt | grep -av 'Status: Success' | tail -40 | sed 's/^/RIG-BTMON: /'
+      exit 1
+    }
+    say "credentials landed over BLE (mode $(stat -c %a /wpa_supplicant.conf)); handing $JOIN to the target"
+    iw phy "$(cat "/sys/class/net/$JOIN/phy80211/name")" set netns 1
+    LINK="the network received over BLE";;
+  *)
+    LINK="the baked network";;
+esac
 wait_pending "$LINK" || exit 1
 say "agent pending over $LINK: $AGENT"
 if ctl exec "$AGENT" -- /bin/busybox true >/dev/null 2>&1; then say "DEFECT: unapproved agent served"; exit 1; fi
@@ -112,8 +135,10 @@ if [ "$MODE" = ap ]; then
   ctl push "$AGENT" /rig/proof.conf /wpa_supplicant.conf || { say "DEFECT: push failed"; exit 1; }
   sleep 5
   prove_session "the credentialed network" || exit 1
+fi
+if [ "$MODE" = ap ] || [ "$MODE" = ble ]; then
   case "$(ctl exec "$AGENT" -- /bin/busybox ip -4 -o addr 2>/dev/null)" in
-    *10.99.0.*) say "target holds a 10.99.0.0/24 lease: it left its access point for $SSID";;
+    *10.99.0.*) say "target holds a 10.99.0.0/24 lease on $SSID";;
     *) say "DEFECT: target is not on the credentialed network"; exit 1;;
   esac
 fi

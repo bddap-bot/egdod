@@ -52,7 +52,17 @@
         "bash -n boot/run-boot.sh",
         "bash -n boot/rig.sh"
       ],
-      "why": "the qemu/OVMF Secure-Boot boot harness and the in-VM hwsim rig it bakes in — a full run needs OVMF firmware, KVM and a booted VM, so the gate checks syntax only; run `bash boot/run-boot.sh` (EGDOD_BOOT_LINK=wired|station|ap) manually to exercise them"
+      "why": "the qemu/OVMF Secure-Boot boot harness and the in-VM hwsim rig it bakes in — a full run needs OVMF firmware, KVM and a booted VM, so the gate checks syntax only; run `bash boot/run-boot.sh` (EGDOD_BOOT_LINK=wired|station|ap|ble) manually to exercise them"
+    },
+    {
+      "paths": [
+        "boot/btvirt.nix",
+        "boot/btvirt-serial-acl.patch"
+      ],
+      "tests": [
+        "nix-build boot/btvirt.nix -o result-btvirt-gate"
+      ],
+      "why": "BlueZ's controller emulator, built from the pinned source for the ble boot mode's virtual air; the gate proves it still builds, the boot run exercises it"
     },
     {
       "paths": [
