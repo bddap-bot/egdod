@@ -123,6 +123,9 @@ enum ControllerCmd {
         network: String,
         #[arg(long, value_name = "PATH")]
         psk_file: PathBuf,
+        /// Bluetooth adapter to scan with (`hci0`); without it, bluetoothd's default.
+        #[arg(long, value_name = "NAME")]
+        adapter: Option<String>,
     },
     /// The controller's own view of itself, including whether it is dialable.
     Status {
@@ -286,13 +289,21 @@ async fn run_controller(state: StateDir, cmd: ControllerCmd) -> Result<()> {
             agent,
             network,
             psk_file,
+            adapter,
         } => {
             let agent = parse_pubkey(&agent).context("agent node id")?;
             let psk = std::fs::read_to_string(&psk_file)
                 .with_context(|| format!("reading PSK from {}", psk_file.display()))?;
             let psk = psk.strip_suffix('\n').unwrap_or(&psk);
             let psk = psk.strip_suffix('\r').unwrap_or(psk);
-            ble::provision(state.load_key()?, agent, network, psk.to_owned()).await
+            ble::provision(
+                state.load_key()?,
+                agent,
+                network,
+                psk.to_owned(),
+                adapter.as_deref(),
+            )
+            .await
         }
         ControllerCmd::Status { json } => std::process::exit(controller::status(&state, json)?),
         ControllerCmd::Exec { agent, argv } => {
