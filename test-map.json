@@ -18,6 +18,7 @@
         "boot/init.c",
       "boot/image.nix",
       "boot/dbus-system.conf",
+      "boot/bluetooth.conf",
       "boot/passwd",
       "boot/group",
         "Cargo.toml",

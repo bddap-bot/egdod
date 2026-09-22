@@ -342,9 +342,19 @@ static int access_point(void) {
     return 1;
 }
 
+static int has_hci(void) {
+    DIR *d = opendir("/sys/class/bluetooth");
+    if (!d) return 0;
+    struct dirent *e;
+    int found = 0;
+    while ((e = readdir(d))) if (!strncmp(e->d_name, "hci", 3)) found = 1;
+    closedir(d);
+    return found;
+}
+
 static int bluetooth(void) {
     const char *id = arg("egdod.controller");
-    if (!id || access("/bin/bluetoothd", X_OK) || access("/bin/dbus-daemon", X_OK)) return 0;
+    if (!id || !has_hci() || access("/bin/bluetoothd", X_OK) || access("/bin/dbus-daemon", X_OK)) return 0;
     if (up.dev[0]) set_addr(up.dev, "0.0.0.0", NULL);
     up.dev[0] = 0;
     mkdir("/run", 0755);
@@ -364,9 +374,8 @@ static int bluetooth(void) {
     char *dav[] = { "/bin/dbus-daemon", "--config-file=/etc/dbus-1/system.conf", "--nofork", NULL };
     up.dbus = spawn(dav);
     sleep(1);
-    char *bav[] = { "/bin/bluetoothd", "--nodetach", "--experimental", NULL };
+    char *bav[] = { "/bin/bluetoothd", "--nodetach", "--noplugin=*", "-f", "/etc/bluetooth/main.conf", NULL };
     up.bluetoothd = spawn(bav);
-    sleep(1);
     char *idw = dup_word(id);
     char *av[] = { "/egdod", "ble", "--controller", idw, "--key-file", "/agent.key", "--output", NETWORKS, NULL };
     up.daemon = spawn(av);

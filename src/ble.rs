@@ -20,7 +20,7 @@ use futures_lite::StreamExt;
 use iroh::{EndpointId, SecretKey, Signature};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet, os::unix::fs::OpenOptionsExt, path::Path, sync::Arc, time::Duration,
+    os::unix::fs::OpenOptionsExt, path::Path, sync::Arc, time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
@@ -35,6 +35,8 @@ const MAX_FRAME: usize = 64 * 1024;
 const SCAN_WAIT: Duration = Duration::from_secs(60);
 const EXCHANGE_WAIT: Duration = Duration::from_secs(30);
 const CHANNEL_WAIT: Duration = Duration::from_secs(3);
+const ADAPTER_WAIT: Duration = Duration::from_secs(10);
+const SERVICE_WAIT: Duration = Duration::from_secs(10);
 
 struct ServerHello {
     agent: EndpointId,
@@ -249,19 +251,28 @@ async fn adapter(name: Option<&str>) -> Result<(Adapter, bool)> {
     let session = bluer::Session::new()
         .await
         .context("connecting to bluetoothd")?;
-    let adapter = match name {
-        Some(name) => session
-            .adapter(name)
-            .with_context(|| format!("opening Bluetooth adapter {name}"))?,
-        None => session
-            .default_adapter()
-            .await
-            .context("finding a Bluetooth adapter")?,
+    let deadline = tokio::time::Instant::now() + ADAPTER_WAIT;
+    let (adapter, powered) = loop {
+        match probe_adapter(&session, name).await {
+            Ok(found) => break found,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(error) => return Err(error).context("finding a Bluetooth adapter"),
+        }
     };
-    let powered = adapter.is_powered().await?;
     if !powered {
         adapter.set_powered(true).await?;
     }
+    Ok((adapter, powered))
+}
+
+async fn probe_adapter(session: &bluer::Session, name: Option<&str>) -> bluer::Result<(Adapter, bool)> {
+    let adapter = match name {
+        Some(name) => session.adapter(name)?,
+        None => session.default_adapter().await?,
+    };
+    let powered = adapter.is_powered().await?;
     Ok((adapter, powered))
 }
 
@@ -441,21 +452,35 @@ async fn serve_on_adapter(
     Ok(())
 }
 
-async fn characteristic(device: &Device) -> Result<RemoteCharacteristic> {
-    for _ in 0..20 {
-        for service in device.services().await? {
-            if service.uuid().await? != SERVICE_UUID {
-                continue;
-            }
-            for characteristic in service.characteristics().await? {
-                if characteristic.uuid().await? == CHARACTERISTIC_UUID {
-                    return Ok(characteristic);
-                }
+async fn find_characteristic(device: &Device) -> bluer::Result<Option<RemoteCharacteristic>> {
+    for service in device.services().await? {
+        if service.uuid().await? != SERVICE_UUID {
+            continue;
+        }
+        for characteristic in service.characteristics().await? {
+            if characteristic.uuid().await? == CHARACTERISTIC_UUID {
+                return Ok(Some(characteristic));
             }
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    bail!("egdod BLE characteristic did not appear")
+    Ok(None)
+}
+
+async fn characteristic(device: &Device) -> Result<RemoteCharacteristic> {
+    let deadline = tokio::time::Instant::now() + SERVICE_WAIT;
+    loop {
+        match find_characteristic(device).await {
+            Ok(Some(characteristic)) => return Ok(characteristic),
+            Ok(None) => bail!("the target exposes no egdod BLE characteristic"),
+            Err(error)
+                if error.kind == bluer::ErrorKind::ServicesUnresolved
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(error) => return Err(error).context("BLE service discovery"),
+        }
+    }
 }
 
 pub async fn provision(
@@ -474,7 +499,6 @@ pub async fn provision(
         let known_devices = adapter.device_addresses().await?;
         let mut events = adapter.discover_devices_with_changes().await?;
         let deadline = tokio::time::Instant::now() + SCAN_WAIT;
-        let mut rejected = HashSet::new();
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -487,14 +511,18 @@ pub async fn provision(
             let AdapterEvent::DeviceAdded(address) = event else {
                 continue;
             };
-            if rejected.contains(&address) {
-                continue;
-            }
             let device = adapter.device(address)?;
-            if device.name().await?.as_deref() == Some(expected_name.as_str())
-                && device.uuids().await?.unwrap_or_default().contains(&SERVICE_UUID)
+            let (Ok(name), Ok(uuids), Ok(paired)) =
+                (device.name().await, device.uuids().await, device.is_paired().await)
+            else {
+                continue;
+            };
+            if name.as_deref() == Some(expected_name.as_str())
+                && uuids.unwrap_or_default().contains(&SERVICE_UUID)
             {
-                rejected.insert(address);
+                if paired {
+                    bail!("{address} holds a bond this target cannot answer; remove it with `bluetoothctl remove {address}`");
+                }
                 let was_known = known_devices.contains(&device.address());
                 *active_during_provisioning.lock().await = Some((device.clone(), was_known));
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -550,10 +578,7 @@ pub async fn provision(
                 .await
                 .context("BLE provisioning exchange timed out")
                 .and_then(|result| result);
-                let _ = device.disconnect().await;
-                if !was_known {
-                    let _ = adapter.remove_device(device.address()).await;
-                }
+                forget(&adapter, &device, was_known).await;
                 *active_during_provisioning.lock().await = None;
                 match attempt {
                     Ok(()) => return Ok::<(), anyhow::Error>(()),
@@ -567,15 +592,19 @@ pub async fn provision(
         result = termination() => result.and_then(|()| Err(anyhow::anyhow!("BLE provisioning interrupted"))),
     };
     if let Some((device, was_known)) = active.lock().await.take() {
-        let _ = device.disconnect().await;
-        if !was_known {
-            let _ = adapter.remove_device(device.address()).await;
-        }
+        forget(&adapter, &device, was_known).await;
     }
     if !was_powered {
         let _ = adapter.set_powered(false).await;
     }
     result
+}
+
+async fn forget(adapter: &Adapter, device: &Device, was_known: bool) {
+    let _ = device.disconnect().await;
+    if !was_known {
+        let _ = adapter.remove_device(device.address()).await;
+    }
 }
 
 #[cfg(test)]
