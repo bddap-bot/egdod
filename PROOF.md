@@ -6,6 +6,9 @@ nixpkgs pinned in `shell.nix`), with only the run's scratch directory shortened
 to `$DEMO`. Where a statement is an inference rather than something seen, it is
 in §6 or labelled inline.
 
+Transcript addresses use the RFC 5737 documentation address `192.0.2.1` in
+place of the test host's LAN address; path labels retain the observed values.
+
 Reproduce: `nix-shell --run ./demo.sh` (`EGDOD_DEMO_RELAY=1` adds the last phase,
 which needs internet).
 
@@ -228,7 +231,7 @@ canary in discovery mode (dialled its own node id through n0 DNS + relay):
   "probe_mode": "discovery",
   "last_probe_path": "relayed",
 approved da7cd766a959aafab3324b5a38d80698a21e672a511d560d1ec59565dc8de471
-egdod: session with da7cd766… via direct-lan (192.168.1.141:46802)
+egdod: session with da7cd766… via direct-lan (192.0.2.1:46802)
 hello-over-the-internet
 node id:   75a4844b4dca92539f8bfd9548b02a6092004b42ad16e1b28f88d1e324d4ce40
 dialable:  yes
