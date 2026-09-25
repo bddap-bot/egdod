@@ -6,6 +6,9 @@ nixpkgs pinned in `shell.nix`), with only the run's scratch directory shortened
 to `$DEMO`. Where a statement is an inference rather than something seen, it is
 in §6 or labelled inline.
 
+Transcript addresses use the RFC 5737 documentation address `192.0.2.1` in
+place of the test host's LAN address; path labels retain the observed values.
+
 Reproduce: `nix-shell --run ./demo.sh` (`EGDOD_DEMO_RELAY=1` adds the last phase,
 which needs internet).
 
