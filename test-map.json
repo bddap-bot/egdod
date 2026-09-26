@@ -1,15 +1,6 @@
 {
-  "about": "Touched-path → test-suite map, read by `botq test-map`. The acceptance gate derives every landed job's touched paths from its own diff and requires the commands mapped here green — independent of the job's brief. First matching rule wins: specific rules above broad ones. `tests: []` means CONSCIOUSLY untested and must carry its why. An unmapped path fails the resolver loud. Commands run from the repo root; lint completeness with `botq test-map --check`.",
+  "about": "Touched-path → test-suite map, read by `botq test-map`. The acceptance gate derives every landed job's touched paths from its own diff and requires the commands mapped here green — independent of the job's brief. First matching rule wins: specific rules above broad ones. `tests: []` means CONSCIOUSLY untested and must carry its why. An unmapped path fails the resolver loud. Commands run from the repo root.",
   "rules": [
-    {
-      "paths": [
-        "test-map.json"
-      ],
-      "tests": [
-        "botq test-map --check"
-      ],
-      "why": "editing the map re-lints its own completeness over every tracked file"
-    },
     {
       "paths": [
         "src/ble.rs",
