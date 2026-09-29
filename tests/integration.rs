@@ -279,11 +279,10 @@ async fn end_to_end() {
     let sessions = state.read_status().unwrap().sessions;
     let s = sessions.first().expect("the session is still published");
     assert_eq!(s.agent, agent_pk);
-    assert_eq!(
-        s.path.to_string(),
-        "direct-local",
-        "a loopback session reported as something else"
-    );
+    // Iroh can discover a LAN path after the loopback dial. The published
+    // label must describe its selected peer address, not the original hint.
+    let remote: SocketAddr = s.remote.parse().expect("a direct peer address");
+    assert_eq!(s.path, egdod::net::classify_ip(remote.ip()));
 
     forwarding.abort();
     agent_task.abort();
