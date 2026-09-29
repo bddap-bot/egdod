@@ -76,3 +76,9 @@ its first received datagram (egdod#3).
 ## License
 
 Dual MIT / Apache-2.0, at your option.
+
+Agent connections use `egdod/1`. Upgrade the controller together with the boot
+image: `egdod/0` is incompatible. Admission (`Pending` or `Approved`) is the
+first controller-to-agent unidirectional stream, before any request is served.
+The pending controller keeps the connection alive until the agent reads the
+decision and closes it. Approval is reliable stream data, not a QUIC close code.

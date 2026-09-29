@@ -2,8 +2,8 @@ use crate::net::{self, RelayChoice};
 use crate::state::{load_or_create_key, OnUnusable};
 use crate::pipe::splice;
 use crate::proto::{
-    read_msg, recv_file_body, send_file_body, stat_and_hash, write_msg, Ack, ExecFrame,
-    PullStart, Request, ALPN, CLOSE_PENDING,
+    read_msg, recv_file_body, send_file_body, stat_and_hash, write_msg, Ack, Admission, ExecFrame,
+    PullStart, Request, ALPN,
 };
 use anyhow::{Context, Result};
 use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream};
@@ -57,10 +57,6 @@ pub async fn run(cfg: Config) -> Result<()> {
         report(format!("dial {attempt}: controller {} via {}", cfg.controller, route(&cfg)));
         let delay = match session(&secret, &cfg).await {
             Ok(Outcome::Pending) => {
-                report(format!(
-                    "waiting for approval: the controller has not approved {} yet",
-                    secret.public()
-                ));
                 backoff = SHORT_RETRY;
                 PENDING_RETRY
             }
@@ -109,12 +105,21 @@ async fn session(secret: &SecretKey, cfg: &Config) -> Result<Outcome> {
     let connected = tokio::time::timeout(CONNECT_TIMEOUT, ep.connect(addr, ALPN)).await;
     let outcome = match connected {
         Err(_) => Err(anyhow::anyhow!("connect timed out after {CONNECT_TIMEOUT:?}")),
-        Ok(Err(e)) if closed_as_pending(&e) => Ok(Outcome::Pending),
         Ok(Err(e)) => Err(anyhow::Error::new(e).context("dialling controller")),
         Ok(Ok(conn)) => {
             let (path, remote) = net::session_path_report(&conn);
             report(format!("connected to controller via {path} ({remote})"));
-            Ok(serve_connection(conn).await)
+            match read_admission(&conn).await {
+                Ok(Admission::Pending) => {
+                    report(format!(
+                        "waiting for approval: the controller has not approved {} yet",
+                        secret.public()
+                    ));
+                    Ok(Outcome::Pending)
+                }
+                Ok(Admission::Approved) => Ok(serve_connection(conn).await),
+                Err(e) => Err(e.context("reading controller admission")),
+            }
         }
     };
     ep.close().await;
@@ -137,26 +142,14 @@ async fn serve_connection(conn: Connection) -> Outcome {
                     }
                 });
             }
-            Err(e) if is_pending_close(&e) => return Outcome::Pending,
             Err(e) => return Outcome::Ended(e),
         }
     }
 }
 
-fn is_pending_close(e: &ConnectionError) -> bool {
-    matches!(e, ConnectionError::ApplicationClosed(close)
-        if u64::from(close.error_code) == u64::from(CLOSE_PENDING))
-}
-
-fn closed_as_pending(e: &iroh::endpoint::ConnectError) -> bool {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(e);
-    while let Some(err) = source {
-        if let Some(ce) = err.downcast_ref::<ConnectionError>() {
-            return is_pending_close(ce);
-        }
-        source = err.source();
-    }
-    false
+async fn read_admission(conn: &Connection) -> Result<Admission> {
+    let mut recv = conn.accept_uni().await?;
+    read_msg(&mut recv).await
 }
 
 async fn handle(mut send: SendStream, mut recv: RecvStream) -> Result<()> {

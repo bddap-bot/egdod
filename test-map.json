@@ -3,6 +3,9 @@
   "rules": [
     {
       "paths": [
+        "src/agent.rs",
+        "src/controller.rs",
+        "src/proto.rs",
         "src/ble.rs",
         "src/main.rs",
         "src/lib.rs",
@@ -22,7 +25,7 @@
         "nix-build default.nix -o result-host-gate",
         "nix-build boot/image.nix -o result-boot-gate"
       ],
-      "why": "the authenticated BLE credential hop spans the existing binary, its static initramfs build and the BlueZ closure in the boot image; all three artifacts must build and the protocol plus existing UDP patch must remain green"
+      "why": "admission and the authenticated BLE credential hop span the existing binary, its static initramfs build and the BlueZ closure in the boot image; all three artifacts must build and the protocol plus existing UDP patch must remain green"
     },
     {
       "paths": [

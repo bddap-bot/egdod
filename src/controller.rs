@@ -10,7 +10,7 @@ use crate::net::{self, Lookup, ProbeMode, RelayChoice};
 use crate::pipe::splice;
 use crate::proto::{
     finish, hex, read_msg, recv_exec_output, recv_file_body, send_file_body,
-    stat_and_hash, write_msg, Ack, PullStart, Request, Route, RouteReply, ALPN, CLOSE_PENDING,
+    stat_and_hash, write_msg, Ack, Admission, PullStart, Request, Route, RouteReply, ALPN,
     PROBE_ALPN, PROBE_PING, PROBE_PONG,
 };
 use crate::state::{now_unix, SessionInfo, StateDir, Status};
@@ -210,6 +210,13 @@ impl ProtocolHandler for ProbeResponder {
     }
 }
 
+async fn send_admission(conn: &Connection, admission: Admission) -> Result<(), AcceptError> {
+    let mut send = conn.open_uni().await?;
+    write_msg(&mut send, &admission).await.map_err(|e| AcceptError::from_boxed(e.into()))?;
+    send.finish()?;
+    Ok(())
+}
+
 #[derive(Clone)]
 struct Acceptor {
     state: StateDir,
@@ -238,10 +245,14 @@ impl ProtocolHandler for Acceptor {
                 tracing::warn!("recording pending agent: {e:#}");
             }
             tracing::warn!(agent = %peer, "unapproved agent held pending; nothing served");
-            conn.close(CLOSE_PENDING.into(), b"pending approval");
+            send_admission(&conn, Admission::Pending).await?;
+            // Keep the stream's connection alive until the agent consumes the
+            // decision and closes it. Closing here can discard unread data.
+            conn.closed().await;
             return Ok(());
         }
 
+        send_admission(&conn, Admission::Approved).await?;
         let (path, remote) = net::session_path_report(&conn);
         tracing::info!(agent = %peer, %path, %remote, "agent connected");
         let id = conn.stable_id();

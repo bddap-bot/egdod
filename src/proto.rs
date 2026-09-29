@@ -14,17 +14,20 @@ use std::path::{Path, PathBuf};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Agent connections. Bumping this is how an incompatible protocol change is made.
-pub const ALPN: &[u8] = b"egdod/0";
+pub const ALPN: &[u8] = b"egdod/1";
 /// Reachability canary: the controller answers this from any dialer, because the
 /// point is to prove a *stranger* can find and reach it.
 pub const PROBE_ALPN: &[u8] = b"egdod-probe/0";
 pub const PROBE_PING: &[u8] = b"egdod-ping";
 pub const PROBE_PONG: &[u8] = b"egdod-alive";
 
-/// QUIC application close code the controller uses to turn away an agent whose
-/// key has not been approved. The agent keys its retry policy off this, which is
-/// the only way a screenless target can log "I am waiting to be approved".
-pub const CLOSE_PENDING: u32 = 1;
+/// First controller-to-agent unidirectional stream. Admission is application
+/// data: a QUIC close is best-effort and cannot reliably carry this decision.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    Pending,
+    Approved,
+}
 
 /// Bound on a single control message. Bulk data never goes through a message, so
 /// this only has to fit an argv or a path.

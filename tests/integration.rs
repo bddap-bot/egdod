@@ -289,3 +289,81 @@ async fn end_to_end() {
     agent_task.abort();
     serving.abort();
 }
+
+/// A close frame has no retransmission guarantee: dropping the first two
+/// seconds of server application packets used to yield "reset by peer" while
+/// the controller had already recorded the agent as pending. Admission must
+/// reach the actual agent on its first connection, without a redial.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_survives_application_packet_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = StateDir::new(dir.path().join("controller"));
+    let node = state.init_key().unwrap().public();
+    let serving = tokio::spawn(controller::serve(controller::ServeConfig {
+        state: state.clone(),
+        relay: RelayChoice::Disabled,
+        probe_interval: Duration::from_secs(3600),
+        probe_timeout: Duration::from_secs(5),
+        restart_after: 1000,
+        bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+    }));
+    let server: SocketAddr = eventually("controller address", || {
+        state.read_status().ok()?.direct_addrs.iter().find_map(|a| a.parse().ok())
+    }).await;
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = socket.local_addr().unwrap();
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = dropped.clone();
+    let proxy = tokio::spawn(async move {
+        let mut client = None;
+        let mut loss_start = None;
+        let mut buf = vec![0; 65535];
+        loop {
+            let (len, from) = socket.recv_from(&mut buf).await.unwrap();
+            let to = if from == server {
+                // QUIC short headers carry 1-RTT data. Leave handshake packets
+                // alone so connect succeeds while the admission is lost.
+                if len > 0 && buf[0] & 0x80 == 0 {
+                    let start = loss_start.get_or_insert_with(Instant::now);
+                    if start.elapsed() < Duration::from_secs(2) {
+                        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                }
+                let Some(to) = client else { continue };
+                to
+            } else {
+                client = Some(from);
+                server
+            };
+            socket.send_to(&buf[..len], to).await.unwrap();
+        }
+    });
+    let log_path = dir.path().join("agent.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_egdod"))
+        .args(["agent", "--controller", &node.to_string(), "--no-relay",
+               "--direct", &proxy_addr.to_string(), "--key-file"])
+        .arg(dir.path().join("agent.key"))
+        .stdout(log.try_clone().unwrap()).stderr(log).kill_on_drop(true)
+        .spawn().unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(25), async {
+        loop {
+            let log = std::fs::read_to_string(&log_path).unwrap();
+            if log.contains("waiting for approval") || log.contains("dial 2:") {
+                break log;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }).await;
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+    proxy.abort();
+    serving.abort();
+    let log = received.expect("agent never learned its admission state");
+    assert!(dropped.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    assert_eq!(state.pending().unwrap().len(), 1);
+    assert!(log.contains("waiting for approval"), "{log}");
+    assert!(!log.contains("dial 2:"), "admission required a retry: {log}");
+    assert!(!log.contains("connection ended"), "{log}");
+}

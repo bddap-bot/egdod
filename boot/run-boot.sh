@@ -244,6 +244,10 @@ if "$BIN" controller --state-dir "$STATE" exec "$AGENT" -- /bin/busybox true >/d
 fi
 echo "unapproved exec refused"
 
+say "the agent must learn that it is pending before approval is granted"
+wait_serial "^egdod: waiting for approval: the controller has not approved $AGENT yet" 30 \
+  || { echo "DEFECT: controller held the agent pending but the agent never learned it" >&2; save_serial; exit 1; }
+
 say "approve by public key, then run commands as root inside the booted VM"
 "$BIN" controller --state-dir "$STATE" approve "$AGENT"
 for _ in $(seq 1 20); do
