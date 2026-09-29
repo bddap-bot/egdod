@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
@@ -27,6 +28,7 @@
 #define NETWORKS "/wpa_supplicant.conf"
 #define STICK "/stick"
 #define DRIVERS STICK "/drivers.sqfs"
+#define KMSG_CHUNK 900
 
 static char cmdline[8192];
 
@@ -122,15 +124,39 @@ static void stop(pid_t *p) {
     *p = -1;
 }
 
-static void modprobe(const char *name) {
-    char *av[] = { "/bin/busybox", "modprobe", "-q", (char *)name, NULL };
-    run(av);
+struct names { char **v; size_t n, cap; };
+
+static void names_add(struct names *l, const char *name) {
+    if (l->n + 2 > l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 64;
+        l->v = realloc(l->v, l->cap * sizeof *l->v);
+        if (!l->v) { printf("init: out of memory\n"); _exit(1); }
+    }
+    l->v[l->n++] = strdup(name);
+}
+
+static void modprobe_all(struct names *l) {
+    if (l->n) {
+        char **av = malloc((l->n + 4) * sizeof *av);
+        if (!av) { printf("init: out of memory\n"); _exit(1); }
+        av[0] = "/bin/busybox";
+        av[1] = "modprobe";
+        av[2] = "-qa";
+        memcpy(av + 3, l->v, l->n * sizeof *av);
+        av[l->n + 3] = NULL;
+        run(av);
+        free(av);
+    }
+    for (size_t i = 0; i < l->n; i++) free(l->v[i]);
+    free(l->v);
+    *l = (struct names){0};
 }
 
 static int field(const char *text, const char *key, char *out, size_t cap);
 
 static void coldplug(void) {
     static const char *buses[] = { "pci", "usb", "sdio", "platform", "virtio", "scsi", "mmc", NULL };
+    struct names aliases = {0};
     for (const char **b = buses; *b; b++) {
         char dir[64];
         snprintf(dir, sizeof dir, "/sys/bus/%s/devices", *b);
@@ -140,10 +166,94 @@ static void coldplug(void) {
         while ((e = readdir(d))) {
             char path[512], uevent[4096], alias[512];
             snprintf(path, sizeof path, "%s/%s/uevent", dir, e->d_name);
-            if (read_file(path, uevent, sizeof uevent) > 0 && field(uevent, "MODALIAS", alias, sizeof alias)) modprobe(alias);
+            if (read_file(path, uevent, sizeof uevent) > 0 && field(uevent, "MODALIAS", alias, sizeof alias)) names_add(&aliases, alias);
         }
         closedir(d);
     }
+    modprobe_all(&aliases);
+}
+
+static void kmsg_line(int out, const char *line, size_t len) {
+    char rec[KMSG_CHUNK + 4];
+    do {
+        size_t take = len < KMSG_CHUNK ? len : KMSG_CHUNK;
+        memcpy(rec, "<5>", 3);
+        memcpy(rec + 3, line, take);
+        if (write(out, rec, take + 3) < 0 && errno != EINVAL) return;
+        line += take;
+        len -= take;
+    } while (len);
+}
+
+static void relay(int in, int out) {
+    char buf[4 * KMSG_CHUNK];
+    size_t n = 0;
+    for (;;) {
+        ssize_t r = read(in, buf + n, sizeof buf - n);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) {
+            if (n) kmsg_line(out, buf, n);
+            _exit(0);
+        }
+        n += r;
+        size_t start = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (buf[i] != '\n') continue;
+            if (i > start) kmsg_line(out, buf + start, i - start);
+            start = i + 1;
+        }
+        if (!start && n == sizeof buf) {
+            kmsg_line(out, buf, n);
+            n = 0;
+        } else {
+            memmove(buf, buf + start, n - start);
+            n -= start;
+        }
+    }
+}
+
+static int relay_in = -1;
+static pid_t relay_pid = -1;
+
+static void start_relay(void) {
+    relay_pid = fork();
+    if (relay_pid) return;
+    for (int fd = 0; fd < 256; fd++) if (fd != relay_in) close(fd);
+    int k = open("/dev/kmsg", O_WRONLY | O_CLOEXEC);
+    if (k < 0) k = open("/dev/console", O_WRONLY | O_CLOEXEC);
+    relay(relay_in, k);
+}
+
+static void console_to_kmsg(void) {
+    int p[2];
+    if (access("/dev/kmsg", W_OK) || pipe2(p, O_CLOEXEC)) {
+        printf("init: no /dev/kmsg errno=%d; output stays on /dev/console only\n", errno);
+        return;
+    }
+    int f = open("/proc/sys/kernel/printk_devkmsg", O_WRONLY);
+    if (f >= 0) { write(f, "on\n", 3); close(f); }
+    relay_in = p[0];
+    start_relay();
+    if (relay_pid < 0) {
+        printf("init: relay fork errno=%d; output stays on /dev/console only\n", errno);
+        close(p[0]);
+        close(p[1]);
+        relay_in = -1;
+        return;
+    }
+    fflush(stdout);
+    dup2(p[1], 1);
+    dup2(p[1], 2);
+    close(p[1]);
+    setvbuf(stdout, NULL, _IOLBF, 0);
+}
+
+static void await_entropy(void) {
+    if (fork()) return;
+    char b;
+    while (getrandom(&b, 1, 0) < 0 && errno == EINTR) {}
+    printf("init: kernel random pool ready\n");
+    _exit(0);
 }
 
 static int drivers_mounted(void) {
@@ -461,8 +571,12 @@ static void wired(void) {
     printf("init: link wired %s\n", up.dev);
     const char *ip = arg("egdod.ip");
     if (!ip) { dhcp(); return; }
-    set_addr(up.dev, dup_word(ip), arg("egdod.mask") ? dup_word(arg("egdod.mask")) : "255.255.255.0");
-    if (arg("egdod.gw")) default_route(up.dev, dup_word(arg("egdod.gw")));
+    char *addr = dup_word(ip);
+    char *mask = arg("egdod.mask") ? dup_word(arg("egdod.mask")) : "255.255.255.0";
+    char *gw = arg("egdod.gw") ? dup_word(arg("egdod.gw")) : NULL;
+    set_addr(up.dev, addr, mask);
+    if (gw) default_route(up.dev, gw);
+    printf("init: %s static address %s/%s router %s\n", up.dev, addr, mask, gw ? gw : "none");
 }
 
 static void stop_bluetooth(pid_t *helper) {
@@ -597,6 +711,7 @@ int main(int argc, char **argv) {
     mount("proc", "/proc", "proc", 0, NULL);
     mount("sysfs", "/sys", "sysfs", 0, NULL);
     mount("devtmpfs", "/dev", "devtmpfs", 0, NULL);
+    console_to_kmsg();
     read_file("/proc/cmdline", cmdline, sizeof cmdline);
     if (!arg("egdod.controller")) printf("init: no egdod.controller on the command line; this image cannot dial anyone\n");
 
@@ -607,15 +722,20 @@ int main(int argc, char **argv) {
     char *sv[] = { "/bin/busybox", "--install", "-s", "/sbin", NULL };
     run(sv);
 
+    int drivers_only = argc > 1 && !strcmp(argv[1], "drivers");
+    if (!drivers_only) await_entropy();
+
     const char *mods = arg("egdod.mods");
     char *ml = mods ? dup_word(mods) : strdup("");
-    for (char *tok = strtok(ml, ","); tok; tok = strtok(NULL, ",")) modprobe(tok);
+    struct names boot = {0};
+    for (char *tok = strtok(ml, ","); tok; tok = strtok(NULL, ",")) names_add(&boot, tok);
+    modprobe_all(&boot);
     mkdir("/sys/firmware", 0755);
     mkdir("/sys/firmware/efi", 0755);
     mkdir("/sys/firmware/efi/efivars", 0755);
     mount("efivarfs", "/sys/firmware/efi/efivars", "efivarfs", 0, NULL);
     drivers();
-    if (argc > 1 && !strcmp(argv[1], "drivers")) return 0;
+    if (drivers_only) return 0;
 
     iface_up("lo");
     up.daemon = up.dhcp = up.dbus = up.bluetoothd = -1;
@@ -632,9 +752,12 @@ int main(int argc, char **argv) {
         pid_t w;
         int lost_link = 0;
         int provisioned = 0;
+        if (relay_in >= 0 && relay_pid < 0) start_relay();
         if (agent <= 0 && up.kind != BLE) agent = spawn(av);
         while ((w = waitpid(-1, &st, WNOHANG)) > 0) {
-            if (w == agent) {
+            if (w == relay_pid) {
+                relay_pid = -1;
+            } else if (w == agent) {
                 printf("init: agent exited; relaunching\n");
                 fflush(stdout);
                 agent = spawn(av);

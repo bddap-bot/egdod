@@ -6,5 +6,6 @@ case "$1" in
     /bin/busybox mkdir -p /etc
     : > /etc/resolv.conf
     for d in $dns; do /bin/busybox printf 'nameserver %s\n' "$d" >> /etc/resolv.conf; done
+    echo "udhcpc: $interface address $ip/$subnet router ${router:-none} dns ${dns:-none}"
     ;;
 esac

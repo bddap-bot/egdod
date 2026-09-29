@@ -24,7 +24,7 @@ cleanup() {
 trap cleanup EXIT
 
 say() { printf '\n=== %s\n' "$*"; }
-clean_serial() { sed 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\x1b[=>]//g' "$SERIAL" | tr -d '\r'; }
+clean_serial() { sed 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\x1b[=>]//g; s/^\[ *[0-9]*\.[0-9]*\] //' "$SERIAL" | tr -d '\r'; }
 save_serial() {
   if [ -n "${EGDOD_BOOT_ARTIFACTS:-}" ]; then
     clean_serial > "$EGDOD_BOOT_ARTIFACTS/boot-$MODE-serial.log"
@@ -68,7 +68,7 @@ start_vm() {
   [ -n "${HCI_PTY:-}" ] && sudo chown "$(id -un)" "$HCI_PTY"
   say "booting under qemu/OVMF with Secure Boot ON"
   "$QEMU" \
-    -machine q35,accel=kvm:tcg -cpu max -m 4096 \
+    -machine q35,accel=kvm:tcg -cpu max,-rdrand,-rdseed -m 4096 \
     -drive if=pflash,format=raw,readonly=on,file="$CODE" \
     -drive if=pflash,format=raw,file="$WORK/vars.fd" \
     -device usb-ehci,id=ehci -drive if=none,id=stick,format=raw,file="$1",snapshot=on \
@@ -251,6 +251,22 @@ for _ in $(seq 1 20); do
   sleep 2
 done
 UID_SEEN=$(cat "$WORK/uid")
+"$BIN" controller --state-dir "$STATE" exec "$AGENT" -- /bin/busybox cat /dev/vcs1 | fold -w 80 >"$WORK/tty0.txt"
+echo "--- tty0, read from the guest's /dev/vcs1 right after approval:"
+grep -v '^ *$' "$WORK/tty0.txt" | tail -25
+for want in "egdod: dial " "egdod: waiting for approval: the controller has not approved $AGENT"; do
+  tr -d '\n' < "$WORK/tty0.txt" | tr -s ' ' | grep -qF "$want" || { echo "DEFECT: tty0 does not show '$want'" >&2; exit 1; }
+done
+echo "tty0 shows the agent's dials and its wait for approval"
+say "firmware and modules load from drivers.sqfs without a failed lookup, even for a module whose init fails"
+"$BIN" controller --state-dir "$STATE" exec "$AGENT" -- /bin/busybox sh -c \
+  'modprobe asus_nb_wmi; modprobe test_firmware && printf rtl_nic/rtl8168e-2.fw > /sys/devices/virtual/misc/test_firmware/trigger_request; echo "compressed modules: $(find /lib/modules -name "*.ko.*" | wc -l)"; dmesg' >"$WORK/fw.txt" 2>&1 || true
+grep -aE 'compressed modules|test_firmware: loaded|failed to load|Invalid ELF' "$WORK/fw.txt" || true
+grep -aq 'test_firmware: loaded: ' "$WORK/fw.txt" || { echo "DEFECT: rtl_nic/rtl8168e-2.fw did not load" >&2; exit 1; }
+! grep -aqE 'failed to load rtl_nic/rtl8168e-2.fw|Invalid ELF' "$WORK/fw.txt" || { echo "DEFECT: a failed firmware lookup or a non-ELF module load" >&2; exit 1; }
+grep -aqx 'compressed modules: 0' "$WORK/fw.txt" || { echo "DEFECT: compressed modules in /lib/modules" >&2; exit 1; }
+grep -a 'init: kernel random pool ready' "$SERIAL" | head -1
+grep -aq 'init: kernel random pool ready' "$SERIAL" || { echo "DEFECT: init never reported the random pool" >&2; exit 1; }
 echo "uid seen by exec: $UID_SEEN"
 [ "$UID_SEEN" = 0 ] || { echo "DEFECT: exec did not run as root" >&2; exit 1; }
 echo "--- uname -a over the wire:"
@@ -264,7 +280,7 @@ SBVAL=$(tr -d ' \n' < "$WORK/sb" | tail -c2)
 [ "$SBVAL" = 01 ] || { echo "DEFECT: SecureBoot value is '$SBVAL', not 01 — Secure Boot not enforcing" >&2; exit 1; }
 echo "SecureBoot value byte is 01: firmware reports Secure Boot on"
 say "the link and the dial, as the target reported them on its console:"
-clean_serial | grep -aE "^(init: |egdod: |udhcpc: lease)" | head -12
+clean_serial | grep -aE "^(init: |egdod: |udhcpc: (lease|eth))" | head -14
 if [ "${EGDOD_BOOT_RELAY:-}" = 1 ]; then
   clean_serial | grep -aq "connected to controller via relayed" \
     || { echo "DEFECT: no relayed dial was observed on the console" >&2; exit 1; }

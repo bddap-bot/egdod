@@ -698,7 +698,7 @@ initramfs, the model firmware makes the stub fail loudly and never start the
 kernel (`Failed to allocate memory for files`, `Failed to load initrd:
 0x800000000000000e`).
 
-What the image weighs now (`sizes.txt`):
+What the image weighed with compressed modules and firmware (`sizes.txt`):
 
 | part | size |
 |---|---|
@@ -748,6 +748,79 @@ RIG: exec as root over the baked network: uid 0
 RIG: station OK
 BOOT OK (station): Secure Boot on, no wired device, the target reached the controller over wireless and was served as root.
 ```
+
+### Real hardware without Secure Boot or RDRAND: every line on tty0, no false failures
+
+A decade-old laptop without Secure Boot booted the stick, brought up its wired link and then
+showed nothing more on its screen, so a stuck agent and a waiting one looked alike. Its
+console also showed `firmware: failed to load rtl_nic/rtl8168e-2.fw (-2)`, `Invalid ELF
+header magic` and `random: crng init done` at 79.6 s. Each was reproduced in the OVMF
+harness with the unfixed image:
+
+- **Nothing from `init` on tty0.** `/dev/console` is the last `console=`, the serial
+  port, so `init`, `udhcpc` and the agent's log wrote only there. tty0 got only the few lines the
+  agent also wrote there directly. Reading the guest's `/dev/vcs1` showed agent
+  lines and no `init:` line.
+- **`failed to load` is a probe, not a failure.** With `test_firmware` asking for
+  `rtl_nic/rtl8168e-2.fw`, the kernel logs two ENOENT lines for the uncompressed name and
+  then loads the `.xz` (`test_firmware: loaded: 3920`).
+- **`Invalid ELF header magic` is busybox's retry.** When a compressed module's init
+  fails (`asus_nb_wmi` in a VM), busybox 1.37 calls `finit_module` again without the
+  compressed flag, and the kernel parses the xz bytes as ELF. With Secure Boot on, the
+  same load prints no such line: the signature check rejects the retry first.
+- **The random pool is late because nobody asks for it.** Without RDRAND, crng was
+  ready only once the agent's key generation blocked in `getrandom`, which starts the
+  kernel's jitter collection. On the laptop that came about a minute after link-up,
+  probably spent in the alias walk (inferred, not measured on the laptop): one busybox
+  `modprobe` per device alias took 2.3 s for 57 aliases in a VM, and `init` walked every
+  alias once per second while it waited for a carrier.
+
+The fix:
+
+- `init` relays its own output and every child's to `/dev/kmsg` (with `printk_devkmsg`
+  on), one record per line, so each line reaches every console the kernel has, stamped
+  with its time. `init` keeps the pipe's read end and restarts the relay if it exits.
+  The agent no longer writes to tty0 itself.
+- The agent prints each dial as `dial N: controller <id> via <route>`, and each refusal as
+  `waiting for approval`. `udhcpc.script` prints the address, router and DNS it
+  applied. A static address is printed too.
+- A child of `init` blocks in `getrandom` from the start of the boot, so the pool fills
+  while drivers load. It prints `init: kernel random pool ready`.
+- One `modprobe -qa` call covers every alias in each walk: 0.2 s for the same 57 aliases.
+- Modules and firmware are stored decompressed in a zstd-compressed `drivers.sqfs`. Every
+  lookup finds the plain name first, and busybox never retries with the wrong flag. The
+  drivers derivation skips Nix's fixup, because stripping a `.ko` removes its signature.
+
+`boot/run-boot.sh` now boots with `-cpu max,-rdrand,-rdseed` and no virtio-rng. After
+approval it reads tty0 from `/dev/vcs1` and requires a dial line and the approval-wait
+line.
+It loads `test_firmware`, asks for `rtl_nic/rtl8168e-2.fw` after a failing
+`modprobe asus_nb_wmi`, and requires the blob to load with no `failed to load`, no
+`Invalid ELF` and no compressed module. The random pool must also be reported. Wired,
+station and access-point runs passed. The pool was ready at 8.9 s, before
+`drivers.sqfs` was mounted. A wired run with Secure Boot off also passed. Its tty0 while awaiting
+approval, from a QEMU screendump:
+
+```
+[   13.808361] init: link wired eth0
+[   14.844029] udhcpc: lease of 10.0.2.15 obtained from 10.0.2.2, lease time 86400
+[   14.850906] udhcpc: eth0 address 10.0.2.15/255.255.255.0 router 10.0.2.2 dns 10.0.2.3
+[   15.810688] init: egdod PID 1 up, launching agent
+[   16.068540] agent pubkey: 86a8affbf24e4d13c2e7e22858ebd560ccfa878eb6437e8f114211bcd96d555a
+[   16.071031] egdod: dial 1: controller 617954640cc7f2c377d07fc8ae53286fbdb1d1921041c92bd02bae2d8e78d971 via 10.0.2.2:52901 directly, no relay
+[   16.277193] egdod: connected to controller via direct-lan (10.0.2.2:52901)
+[   16.437644] egdod: waiting for approval: the controller has not approved 86a8affbf24e4d13c2e7e22858ebd560ccfa878eb6437e8f114211bcd96d555a yet
+```
+
+What the image weighs now (`sizes.txt`):
+
+| part | size |
+|---|---|
+| `/lib/modules` (complete, decompressed, in `drivers.sqfs`) | 497 MB |
+| `/lib/firmware` (27 non-free packages, decompressed, in `drivers.sqfs`) | 1.1 GB |
+| `drivers.sqfs` (zstd squashfs) | 585 MB |
+| `initrd.img` | 92 MB |
+| `esp.img` | 756 MB |
 
 ### No cable: a baked network, and the access point the target hosts when there is none
 
@@ -1050,9 +1123,9 @@ next round of proving.
 
 - **The firmware set covers the radios it names.** `PROOF.md` lists the drivers
   exercised (`e1000`, `e1000e`, `virtio_net`, `mac80211_hwsim`); every other
-  driver in the tree is present and its firmware alongside, and the kernel's
-  in-place xz firmware load is a documented path, but no such driver has been
-  watched requesting a blob from `drivers.sqfs`.
+  driver in the tree is present and its firmware alongside, and `run-boot.sh` has
+  watched `test_firmware` load a blob from `drivers.sqfs`, but no real radio
+  driver has been watched doing so.
 - **Any BlueZ controller host connects to the target over LE.** Watched with
   the test host's BlueZ 5.86 and the emulator's dual-mode controller: the
   BR/EDR-not-supported flag in the target's advertisement is what its bearer

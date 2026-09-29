@@ -1,11 +1,3 @@
-//! The target side: dial out, forever, and serve whatever the controller opens.
-//!
-//! The agent never listens for inbound connections and never learns a secret from
-//! the image — its own keypair is generated on first run and its identity is the
-//! iroh NodeId derived from it, which is exactly the key the controller approves.
-//! That is why there is no application-level handshake here: QUIC has already
-//! proved possession of that key by the time a connection exists.
-
 use crate::net::{self, RelayChoice};
 use crate::state::{load_or_create_key, OnUnusable};
 use crate::pipe::splice;
@@ -25,22 +17,11 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
-/// Retry floor after a *successful* connection, so approval is picked up quickly.
 const SHORT_RETRY: Duration = Duration::from_secs(1);
-/// A target that is merely unapproved should not hammer the relay while a human
-/// gets around to approving it.
 const PENDING_RETRY: Duration = Duration::from_secs(5);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const EXEC_CHUNK: usize = 32 * 1024;
-/// How long exec output may be entirely idle before the pipes are declared
-/// abandoned. Short on purpose: `exec sshd` leaves a daemon holding them, and
-/// every such command would otherwise wait this out before returning.
 const DRAIN_IDLE: Duration = Duration::from_secs(2);
-/// Backstop on the whole drain. Once the command has exited, the only output
-/// legitimately still owed is whatever sits in the two pipe buffers — at most a
-/// couple of hundred KiB, which is seconds even through a relay. Anything still
-/// arriving after this is a live writer the command left behind, not a drain,
-/// and waiting on it is waiting forever.
 const DRAIN_CAP: Duration = Duration::from_secs(15);
 
 pub struct Config {
@@ -51,25 +32,13 @@ pub struct Config {
 }
 
 enum Outcome {
-    /// The controller turned us away: not approved yet.
     Pending,
-    /// We were connected and the connection ended.
-    Ended,
+    Ended(ConnectionError),
 }
 
-/// Never returns. A target has no screen and nobody to press a key on it, so
-/// every failure here is a sleep and another attempt.
 pub async fn run(cfg: Config) -> Result<()> {
     tracing::info!(controller = %cfg.controller, "egdod agent starting");
 
-    // Retried rather than propagated: the key file lives on whatever storage the
-    // target happened to boot with, and a filesystem that is not writable yet is
-    // exactly the kind of transient a screenless machine has to sit through.
-    // Returning an error here would exit the process with nobody to restart it.
-    //
-    // The agent keeps this key across reboots so an approved target stays
-    // approved; on a tmpfs initramfs it is regenerated per boot and needs
-    // approving again, which is a property of the medium, not of this code.
     let secret = loop {
         match load_or_create_key(&cfg.key_file, OnUnusable::Replace) {
             Ok(s) => break s,
@@ -79,24 +48,24 @@ pub async fn run(cfg: Config) -> Result<()> {
             }
         }
     };
-    // stdout, not a log line: on a bare target this print is how the operator
-    // learns which key to approve, e.g. from a serial console capture.
     println!("agent pubkey: {}", secret.public());
-    console(&format!("agent pubkey: {}", secret.public()));
 
     let mut backoff = SHORT_RETRY;
+    let mut attempt = 0u64;
     loop {
+        attempt += 1;
+        report(format!("dial {attempt}: controller {} via {}", cfg.controller, route(&cfg)));
         let delay = match session(&secret, &cfg).await {
             Ok(Outcome::Pending) => {
                 report(format!(
-                    "controller has not approved {} yet; retrying",
+                    "waiting for approval: the controller has not approved {} yet",
                     secret.public()
                 ));
                 backoff = SHORT_RETRY;
                 PENDING_RETRY
             }
-            Ok(Outcome::Ended) => {
-                report("controller connection ended; redialing".into());
+            Ok(Outcome::Ended(e)) => {
+                report(format!("controller connection ended ({e}); redialing"));
                 backoff = SHORT_RETRY;
                 SHORT_RETRY
             }
@@ -111,31 +80,25 @@ pub async fn run(cfg: Config) -> Result<()> {
     }
 }
 
-fn console(line: &str) {
-    use std::io::Write;
-    let stdout_dev = rustix::fs::fstat(std::io::stdout()).ok().map(|s| s.st_rdev);
-    for dev in ["/dev/console", "/dev/tty0"] {
-        let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(dev) else {
-            continue;
-        };
-        if rustix::fs::fstat(&f).ok().map(|s| s.st_rdev) == stdout_dev {
-            continue;
-        }
-        let _ = writeln!(f, "egdod: {line}");
+fn report(line: String) {
+    eprintln!("egdod: {line}");
+}
+
+fn route(cfg: &Config) -> String {
+    let relay = match &cfg.relay {
+        RelayChoice::N0 => "the public relays".to_string(),
+        RelayChoice::Disabled => "no relay".to_string(),
+        RelayChoice::Urls(urls) => urls.join(", "),
+    };
+    if cfg.direct.is_empty() {
+        format!("{relay}, address found by DNS")
+    } else {
+        let direct: Vec<String> = cfg.direct.iter().map(|a| a.to_string()).collect();
+        format!("{} directly, {relay}", direct.join(", "))
     }
 }
 
-/// The log is stderr; a target with nobody logged in shows its screen and
-/// serial console, so every dial state change goes there too.
-fn report(line: String) {
-    tracing::info!("{line}");
-    console(&line);
-}
-
 async fn session(secret: &SecretKey, cfg: &Config) -> Result<Outcome> {
-    // No publishing: a target should leave no discoverable record of itself.
-    // No resolving either when it was told exactly where to dial, which is what
-    // makes a DNS-free target possible (`--direct`, plus an IP-literal `--relay`).
     let lookup = if cfg.direct.is_empty() {
         net::Lookup::Resolve
     } else {
@@ -146,9 +109,6 @@ async fn session(secret: &SecretKey, cfg: &Config) -> Result<Outcome> {
     let connected = tokio::time::timeout(CONNECT_TIMEOUT, ep.connect(addr, ALPN)).await;
     let outcome = match connected {
         Err(_) => Err(anyhow::anyhow!("connect timed out after {CONNECT_TIMEOUT:?}")),
-        // The controller can close before we ever accept a stream, so "not
-        // approved" has to be recognised here too or the target loses the only
-        // signal it can log about why it is getting nowhere.
         Ok(Err(e)) if closed_as_pending(&e) => Ok(Outcome::Pending),
         Ok(Err(e)) => Err(anyhow::Error::new(e).context("dialling controller")),
         Ok(Ok(conn)) => {
@@ -157,15 +117,11 @@ async fn session(secret: &SecretKey, cfg: &Config) -> Result<Outcome> {
             Ok(serve_connection(conn).await)
         }
     };
-    // Closing explicitly keeps the peer from waiting out an idle timeout, and
-    // keeps iroh from complaining about a dropped endpoint on every redial.
     ep.close().await;
     outcome
 }
 
 async fn serve_connection(conn: Connection) -> Outcome {
-    // The target has nobody to ask, so the log it leaves behind is the whole
-    // record of how it was talking to the controller.
     let mut changes = net::path_changes(conn.clone());
     tokio::spawn(async move {
         while let Some((was, now, remote)) = changes.recv().await {
@@ -182,10 +138,7 @@ async fn serve_connection(conn: Connection) -> Outcome {
                 });
             }
             Err(e) if is_pending_close(&e) => return Outcome::Pending,
-            Err(e) => {
-                tracing::debug!("connection closed: {e}");
-                return Outcome::Ended;
-            }
+            Err(e) => return Outcome::Ended(e),
         }
     }
 }
@@ -217,8 +170,6 @@ async fn handle(mut send: SendStream, mut recv: RecvStream) -> Result<()> {
             sha256,
         } => {
             let dest = PathBuf::from(&path);
-            // No ceiling this way: the sender is the controller, which QUIC has
-            // already authenticated and which holds root here regardless.
             let result =
                 recv_file_body(&mut recv, &dest, len, sha256, mode, u64::MAX).await;
             let ack = match &result {
@@ -269,9 +220,6 @@ async fn handle(mut send: SendStream, mut recv: RecvStream) -> Result<()> {
     }
 }
 
-/// Runs argv with the agent's own privileges — root when the agent is init, which
-/// is the deployment this is for. stdout and stderr stay distinguishable all the
-/// way to the controller's own stdout/stderr.
 async fn exec(argv: Vec<String>, mut send: SendStream) -> Result<()> {
     let Some((program, args)) = argv.split_first() else {
         write_msg(&mut send, &ExecFrame::Failed("empty argv".into())).await?;
@@ -281,8 +229,6 @@ async fn exec(argv: Vec<String>, mut send: SendStream) -> Result<()> {
     tracing::info!(?argv, "exec");
     let child = tokio::process::Command::new(program)
         .args(args)
-        // No stdin: v0 exec is fire-and-collect, and a command that blocks on a
-        // terminal that does not exist would hang forever.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -298,8 +244,6 @@ async fn exec(argv: Vec<String>, mut send: SendStream) -> Result<()> {
     let mut stdout = child.stdout.take().expect("stdout was piped");
     let mut stderr = child.stderr.take().expect("stderr was piped");
 
-    // One writer owns the stream; the two readers feed it, which is what keeps
-    // stdout and stderr framed separately instead of interleaved into one blob.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ExecFrame>(16);
     let out_tx = tx.clone();
     let out = tokio::spawn(async move { pump_frames(&mut stdout, &out_tx, true).await });
@@ -325,9 +269,6 @@ async fn exec(argv: Vec<String>, mut send: SendStream) -> Result<()> {
 
     let status = child.wait().await.context("waiting for child")?;
     let cut = drain_output(out, err, &progress).await;
-    // Bounded too: with the pumps aborted the writer's senders are gone, so it
-    // only has its current frame left to push, and if the peer has stopped
-    // reading entirely there is nothing useful left to say to it anyway.
     if let Ok(Ok(Some(mut send))) = tokio::time::timeout(DRAIN_CAP, writer).await {
         if cut {
             write_msg(&mut send, &ExecFrame::Truncated).await?;
@@ -338,35 +279,17 @@ async fn exec(argv: Vec<String>, mut send: SendStream) -> Result<()> {
     Ok(())
 }
 
-/// What the output side is doing, so a drain can tell "nothing left to send"
-/// from "plenty left to send and the peer is slow".
 #[derive(Default)]
 struct Progress {
-    /// Frames handed to the stream since the command exited.
     frames: AtomicU64,
-    /// Whether the writer is inside a send right now. Without this, a peer that
-    /// has stopped reading looks exactly like a pipe nobody will write to again.
     sending: std::sync::atomic::AtomicBool,
 }
 
-/// Waits for the two output pumps to reach EOF after the command exited, and
-/// reports whether it gave up on them.
-///
-/// This has to be bounded: `exec foo &`-style commands leave a daemon holding
-/// the same pipes, which are then never closed, and the exit status would never
-/// arrive. But bounding it on elapsed time alone throws away the output of
-/// anything still streaming, so the deadline only fires when the output side is
-/// genuinely idle — no frames sent and the writer not blocked mid-send. A slow
-/// controller keeps the writer blocked and buys more time; a daemon on the far
-/// end of an open pipe does not. `DRAIN_CAP` is the backstop for the case where
-/// the peer never reads again.
 async fn drain_output(
     out: tokio::task::JoinHandle<()>,
     err: tokio::task::JoinHandle<()>,
     progress: &Progress,
 ) -> bool {
-    // Aborting is not the same as dropping: a dropped handle detaches its task,
-    // which keeps that task's channel sender alive and the writer waiting forever.
     let aborts = [out.abort_handle(), err.abort_handle()];
     let mut both = tokio::spawn(async move {
         let _ = tokio::join!(out, err);

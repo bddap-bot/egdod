@@ -63,8 +63,8 @@ let
   mods = [ "efivarfs" "loop" "squashfs" "vfat" "nls_cp437" "nls_ascii" ];
   bootModules = [
     "drivers/usb/host" "drivers/usb/storage" "drivers/ata" "drivers/nvme/host" "drivers/mmc"
-    "drivers/misc/cardreader" "drivers/scsi/sd_mod.ko.xz" "drivers/scsi/virtio_scsi.ko.xz"
-    "drivers/block/virtio_blk.ko.xz" "drivers/block/loop.ko.xz"
+    "drivers/misc/cardreader" "drivers/scsi/sd_mod.ko" "drivers/scsi/virtio_scsi.ko"
+    "drivers/block/virtio_blk.ko" "drivers/block/loop.ko"
     "fs/fat" "fs/squashfs" "fs/nls" "fs/efivarfs"
   ];
   cmdline = "console=tty0 console=ttyS0,115200 egdod.controller=${controllerNodeId} egdod.mods="
@@ -72,6 +72,7 @@ let
   drivers = pkgs.stdenv.mkDerivation {
     name = "egdod-drivers";
     dontUnpack = true;
+    dontFixup = true;
     nativeBuildInputs = [ pkgs.dpkg pkgs.xz ];
     buildPhase = ''
     set -euo pipefail
@@ -82,23 +83,18 @@ let
     mkdir -p rootfs/lib/modules/${krel} rootfs/lib/firmware
 
     cp -r "$KMOD/kernel" "$KMOD/modules.order" "$KMOD/modules.builtin" "rootfs/lib/modules/${krel}/"
+    find "rootfs/lib/modules/${krel}/kernel" -name '*.ko.xz' -print0 | xargs -0 -P "$NIX_BUILD_CORES" -n 64 xz -d
     ${pkgs.pkgsStatic.busybox}/bin/busybox depmod -b rootfs ${krel}
     tr ' ' '\n' < "rootfs/lib/modules/${krel}/modules.dep" | sed 's/:$//' | grep -v '^$' | sort -u | while read -r m; do
       [ -n "$m" ] && [ -e "rootfs/lib/modules/${krel}/$m" ] || { echo "module tree is missing dependency $m" >&2; exit 1; }
     done
     for m in mac80211_hwsim e1000 iwlmvm ath9k ath11k_pci rtw88_8822ce rtw89_8852be mt7921e brcmfmac r8169 cdc_ether; do
-      grep -q "/$m.ko.xz:" "rootfs/lib/modules/${krel}/modules.dep" || { echo "module tree lacks $m" >&2; exit 1; }
+      grep -q "/$m.ko:" "rootfs/lib/modules/${krel}/modules.dep" || { echo "module tree lacks $m" >&2; exit 1; }
     done
 
     cp -r x/fw/usr/lib/firmware/. rootfs/lib/firmware/
-    find rootfs/lib/firmware -type l -print0 | while IFS= read -r -d ''' l; do
-      t=$(readlink -f "$l" || true)
-      if [ -f "$t" ]; then printf '%s\0%s\0' "$l" "$(realpath --relative-to="$(dirname "$l")" "$t")"; fi
-      [ -d "$t" ] || rm "$l"
-    done > links
-    find rootfs/lib/firmware -type f -print0 | xargs -0 -P "$NIX_BUILD_CORES" -n 32 xz -6 --check=crc32
-    while IFS= read -r -d ''' l && IFS= read -r -d ''' t; do ln -s "$t.xz" "$l.xz"; done < links
-    find rootfs/lib/firmware -xtype l -print -quit | grep -q . && { echo "dangling firmware symlink" >&2; exit 1; }
+    find rootfs/lib/firmware -xtype l -delete
+    [ -e rootfs/lib/firmware/rtl_nic/rtl8168e-2.fw ] || { echo "firmware tree lacks rtl_nic/rtl8168e-2.fw" >&2; exit 1; }
 
     du -sh rootfs/lib/modules rootfs/lib/firmware > sizes.txt
     '';
@@ -135,7 +131,7 @@ let
     KD=${drivers}/lib/modules/${krel}
     for p in ${toString bootModules}; do
       [ -e "$KD/kernel/$p" ] || { echo "module tree lacks $p" >&2; exit 1; }
-      ( cd "$KD" && find "kernel/$p" -name '*.ko.xz' )
+      ( cd "$KD" && find "kernel/$p" -name '*.ko' )
     done | while read -r f; do grep -m1 "^$f:" "$KD/modules.dep"; done | tr ' ' '\n' | sed 's/:$//' | grep -v '^$' | sort -u | while read -r m; do
       install -D -m 444 "$KD/$m" "rootfs/lib/modules/${krel}/$m"
     done
@@ -171,7 +167,7 @@ pkgs.stdenv.mkDerivation {
     cp "$GRUB"    esp/EFI/BOOT/grubx64.efi
     cp ${initrd}/vmlinuz esp/vmlinuz
     cp ${initrd}/initrd.img esp/initrd.img
-    mksquashfs ${drivers}/lib esp/drivers.sqfs -no-compression -all-root -no-xattrs -no-progress >/dev/null
+    mksquashfs ${drivers}/lib esp/drivers.sqfs -comp zstd -all-root -no-xattrs -no-progress >/dev/null
 
     cat > cfg <<CFG
     set timeout=1
