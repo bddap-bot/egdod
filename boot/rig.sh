@@ -12,6 +12,7 @@ if [ "${1:-}" != ns ]; then
   mount -t proc proc /proc
   mount -t sysfs sysfs /sys
   mount -t devtmpfs devtmpfs /dev
+  /init.egdod drivers
   modprobe mac80211_hwsim radios=3
   for _ in 1 2 3 4 5 6 7 8 9 10; do [ "$(ls /sys/class/ieee80211 2>/dev/null | wc -l)" -ge 3 ] && break; sleep 1; done
   PHYS=""

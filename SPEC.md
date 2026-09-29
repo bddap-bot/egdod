@@ -100,7 +100,17 @@ and the full non-free firmware set, pinned by hash like the kernel, and `init` l
 walking every device's modalias through modprobe rather than from a list. Size is never a reason
 to drop a driver, a firmware blob, or a module tree; `PROOF.md` records what the image weighs as a
 fact, not as a cost to reduce. `egdod.mods=` on the command line names only what a modalias cannot
-express (`efivarfs`).
+express (`efivarfs`, and the loop device and filesystems that mount the stick).
+
+Nothing is dropped; the set lives on the stick rather than in the initramfs, because old firmware
+cannot be trusted to hand a half-gigabyte initramfs to the kernel. The kernel loads a small initramfs itself (`initrd=` on its
+command line, not GRUB's `initrd`) holding `init`, the userland and only the drivers that reach
+the stick: USB, ATA, NVMe, virtio and SD hosts, USB and SCSI disks, loop, squashfs and FAT. The
+complete module and firmware set sits beside it on the stick's FAT as `drivers.sqfs`. `init`
+walks modaliases with the small set until a block device's FAT holds `drivers.sqfs` with modules
+for the running kernel, mounts it over `/lib`, and only then walks every device against the
+complete set, so no driver outside the small set probes before its firmware is reachable. The
+stick stays attached while the agent runs: modules and firmware load from it on demand.
 
 ## Getting onto a network: wired, baked station, derived access point, BLE
 

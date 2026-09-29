@@ -60,7 +60,15 @@ let
             else "";
   netArg = if ip != "" then " egdod.ip=${ip} egdod.mask=${mask}" + (if gw != "" then " egdod.gw=${gw}" else "")
            else "";
-  cmdline = "console=tty0 console=ttyS0,115200 egdod.controller=${controllerNodeId} egdod.mods=efivarfs" + netArg + dialArg;
+  mods = [ "efivarfs" "loop" "squashfs" "vfat" "nls_cp437" "nls_ascii" ];
+  bootModules = [
+    "drivers/usb/host" "drivers/usb/storage" "drivers/ata" "drivers/nvme/host" "drivers/mmc"
+    "drivers/misc/cardreader" "drivers/scsi/sd_mod.ko.xz" "drivers/scsi/virtio_scsi.ko.xz"
+    "drivers/block/virtio_blk.ko.xz" "drivers/block/loop.ko.xz"
+    "fs/fat" "fs/squashfs" "fs/nls" "fs/efivarfs"
+  ];
+  cmdline = "console=tty0 console=ttyS0,115200 egdod.controller=${controllerNodeId} egdod.mods="
+    + pkgs.lib.concatStringsSep "," mods + netArg + dialArg;
   drivers = pkgs.stdenv.mkDerivation {
     name = "egdod-drivers";
     dontUnpack = true;
@@ -124,10 +132,18 @@ let
     cp ${./group} rootfs/etc/group
     cp ${./udhcpc.script} rootfs/bin/udhcpc.script
     chmod +x rootfs/bin/udhcpc.script
-    cp -r ${drivers}/lib rootfs/lib
+    KD=${drivers}/lib/modules/${krel}
+    for p in ${toString bootModules}; do
+      [ -e "$KD/kernel/$p" ] || { echo "module tree lacks $p" >&2; exit 1; }
+      ( cd "$KD" && find "kernel/$p" -name '*.ko.xz' )
+    done | while read -r f; do grep -m1 "^$f:" "$KD/modules.dep"; done | tr ' ' '\n' | sed 's/:$//' | grep -v '^$' | sort -u | while read -r m; do
+      install -D -m 444 "$KD/$m" "rootfs/lib/modules/${krel}/$m"
+    done
+    cp "$KD/modules.order" "$KD/modules.builtin" "rootfs/lib/modules/${krel}/"
+    ${pkgs.pkgsStatic.busybox}/bin/busybox depmod -b rootfs ${krel}
     ( cd rootfs && find . -print0 | cpio --null -H newc -o 2>/dev/null | gzip -1 ) > initrd.img
     cat ${drivers}/sizes.txt > sizes.txt
-    du -sh rootfs/bin rootfs/nix/store initrd.img >> sizes.txt
+    du -sh rootfs/bin rootfs/nix/store rootfs/lib initrd.img >> sizes.txt
     '';
     installPhase = ''
     mkdir -p $out
@@ -139,7 +155,7 @@ in
 pkgs.stdenv.mkDerivation {
   name = "egdod-stick";
   dontUnpack = true;
-  nativeBuildInputs = [ pkgs.dpkg pkgs.mtools pkgs.dosfstools ];
+  nativeBuildInputs = [ pkgs.dpkg pkgs.mtools pkgs.dosfstools pkgs.squashfsTools ];
 
   buildPhase = ''
     set -euo pipefail
@@ -155,6 +171,7 @@ pkgs.stdenv.mkDerivation {
     cp "$GRUB"    esp/EFI/BOOT/grubx64.efi
     cp ${initrd}/vmlinuz esp/vmlinuz
     cp ${initrd}/initrd.img esp/initrd.img
+    mksquashfs ${drivers}/lib esp/drivers.sqfs -no-compression -all-root -no-xattrs -no-progress >/dev/null
 
     cat > cfg <<CFG
     set timeout=1
@@ -162,8 +179,7 @@ pkgs.stdenv.mkDerivation {
     terminal_input serial console
     terminal_output serial console
     menuentry "egdod" {
-      linux /vmlinuz ${cmdline}
-      initrd /initrd.img
+      linux /vmlinuz initrd=/initrd.img ${cmdline}
     }
     CFG
     sed 's/^    //' cfg > esp/EFI/debian/grub.cfg
@@ -174,7 +190,7 @@ pkgs.stdenv.mkDerivation {
     ( cd esp && find . -type d ! -name . -printf '%P\n' ) | while read -r d; do mmd -i esp.img "::$d"; done
     ( cd esp && find . -type f -printf '%P\n' ) | while read -r f; do mcopy -i esp.img "esp/$f" "::$f"; done
     cat ${initrd}/sizes.txt > sizes.txt
-    du -sh esp.img >> sizes.txt
+    du -sh esp/drivers.sqfs esp.img >> sizes.txt
   '';
 
   installPhase = ''

@@ -54,7 +54,7 @@ fi
 boot() {
   for attempt in 1 2 3; do
     start_vm "$@"
-    if wait_serial "EFI stub: UEFI Secure Boot is enabled" 30 >/dev/null; then return 0; fi
+    if wait_serial "EFI stub: UEFI Secure Boot is enabled" 90 >/dev/null; then return 0; fi
     kill "$QEMU_PID" 2>/dev/null || true
     wait "$QEMU_PID" 2>/dev/null || true
     echo "firmware attempt $attempt did not reach the kernel: $(clean_serial | grep -aoE "BdsDxe: [^\r]*" | tail -1)"
@@ -71,7 +71,8 @@ start_vm() {
     -machine q35,accel=kvm:tcg -cpu max -m 4096 \
     -drive if=pflash,format=raw,readonly=on,file="$CODE" \
     -drive if=pflash,format=raw,file="$WORK/vars.fd" \
-    -drive format=raw,file="$1",if=ide,snapshot=on \
+    -device usb-ehci,id=ehci -drive if=none,id=stick,format=raw,file="$1",snapshot=on \
+    -device usb-storage,bus=ehci.0,drive=stick,bootindex=0 \
     "${@:2}" \
     -display none -vga none -serial "file:$SERIAL" "${HCI_ARGS[@]}" -no-reboot >"$WORK/qemu.log" 2>&1 &
   QEMU_PID=$!

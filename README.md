@@ -33,8 +33,9 @@ about which of those ran where. The static binary meant for a machine with no us
 that same approve-and-exec loop, hermetically on loopback (`PROOF.md`, demo step 18).
 
 The boot now exists too. `boot/image.nix` builds a stick image from a
-distro-signed chain plus our own unsigned initramfs — every driver Debian
-builds for that kernel and the full non-free firmware set, loaded by modalias —
+distro-signed chain plus our own unsigned initramfs and, beside it on the
+stick, every driver Debian builds for that kernel and the full non-free
+firmware set, loaded by modalias —
 and `boot/run-boot.sh` was watched booting it under OVMF with Secure Boot
 enforcing: the agent runs as PID 1, finds a link (a cable, a baked wireless
 network, an access point it hosts itself for the controller to join, or network

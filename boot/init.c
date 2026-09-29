@@ -14,6 +14,7 @@
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -24,6 +25,8 @@
 #define DHCP_WAIT 20
 #define RETRY_WAIT 30
 #define NETWORKS "/wpa_supplicant.conf"
+#define STICK "/stick"
+#define DRIVERS STICK "/drivers.sqfs"
 
 static char cmdline[8192];
 
@@ -124,8 +127,10 @@ static void modprobe(const char *name) {
     run(av);
 }
 
+static int field(const char *text, const char *key, char *out, size_t cap);
+
 static void coldplug(void) {
-    static const char *buses[] = { "pci", "usb", "sdio", "platform", "virtio", NULL };
+    static const char *buses[] = { "pci", "usb", "sdio", "platform", "virtio", "scsi", "mmc", NULL };
     for (const char **b = buses; *b; b++) {
         char dir[64];
         snprintf(dir, sizeof dir, "/sys/bus/%s/devices", *b);
@@ -133,11 +138,57 @@ static void coldplug(void) {
         if (!d) continue;
         struct dirent *e;
         while ((e = readdir(d))) {
-            char path[512], alias[512];
-            snprintf(path, sizeof path, "%s/%s/modalias", dir, e->d_name);
-            if (read_file(path, alias, sizeof alias) > 0) modprobe(alias);
+            char path[512], uevent[4096], alias[512];
+            snprintf(path, sizeof path, "%s/%s/uevent", dir, e->d_name);
+            if (read_file(path, uevent, sizeof uevent) > 0 && field(uevent, "MODALIAS", alias, sizeof alias)) modprobe(alias);
         }
         closedir(d);
+    }
+}
+
+static int drivers_mounted(void) {
+    struct stat root, lib;
+    return !stat("/", &root) && !stat("/lib", &lib) && root.st_dev != lib.st_dev;
+}
+
+static int drivers_from(const char *dev) {
+    char *vfat[] = { "/bin/busybox", "mount", "-t", "vfat", "-o", "ro", (char *)dev, STICK, NULL };
+    char *sqfs[] = { "/bin/busybox", "mount", "-t", "squashfs", "-o", "ro,loop", DRIVERS, "/lib", NULL };
+    if (run(vfat)) return 0;
+    if (!access(DRIVERS, R_OK) && !run(sqfs)) {
+        struct utsname u;
+        char dep[128];
+        uname(&u);
+        snprintf(dep, sizeof dep, "/lib/modules/%s/modules.dep", u.release);
+        if (!access(dep, R_OK)) return 1;
+        umount("/lib");
+    }
+    umount(STICK);
+    return 0;
+}
+
+static void drivers(void) {
+    if (drivers_mounted()) return;
+    mkdir(STICK, 0755);
+    for (int t = 0;; t++) {
+        coldplug();
+        DIR *d = opendir("/sys/class/block");
+        struct dirent *e;
+        while (d && (e = readdir(d))) {
+            if (e->d_name[0] == '.' || !strncmp(e->d_name, "loop", 4) || !strncmp(e->d_name, "ram", 3)
+                || !strncmp(e->d_name, "zram", 4)) continue;
+            char dev[300];
+            snprintf(dev, sizeof dev, "/dev/%s", e->d_name);
+            if (drivers_from(dev)) {
+                printf("init: every driver and firmware file from %s on %s\n", DRIVERS, dev);
+                closedir(d);
+                return;
+            }
+        }
+        if (d) closedir(d);
+        if (t % RETRY_WAIT == RETRY_WAIT - 1) printf("init: still looking for a block device holding %s\n", DRIVERS);
+        fflush(stdout);
+        sleep(1);
     }
 }
 
@@ -539,7 +590,7 @@ static void relink(pid_t *agent, char ***av) {
     fflush(stdout);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     mkdir("/proc", 0755);
     mkdir("/sys", 0755);
     mkdir("/dev", 0755);
@@ -563,6 +614,8 @@ int main(void) {
     mkdir("/sys/firmware/efi", 0755);
     mkdir("/sys/firmware/efi/efivars", 0755);
     mount("efivarfs", "/sys/firmware/efi/efivars", "efivarfs", 0, NULL);
+    drivers();
+    if (argc > 1 && !strcmp(argv[1], "drivers")) return 0;
 
     iface_up("lo");
     up.daemon = up.dhcp = up.dbus = up.bluetoothd = -1;

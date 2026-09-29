@@ -555,7 +555,9 @@ modalias cannot express (`efivarfs`). The kernel's own module requests
 (`/sbin/modprobe` for `crypto-ccm(aes)` when a wireless key is installed, for
 instance) reach the same busybox.
 
-What the image weighs, as built (`sizes.txt` in the derivation output):
+What the image weighed with everything in the initramfs (`sizes.txt` in the
+derivation output); the modules and firmware have since moved to the stick (next
+section):
 
 | part | size |
 |---|---|
@@ -616,6 +618,136 @@ Which drivers were *exercised*: `e1000`, `e1000e`, `virtio_net` (this section),
 `mac80211_hwsim` (below). The set *covers* every driver Debian builds for this
 kernel; "covers" is an inference about the machine in front of you, "exercised"
 is what was watched.
+
+### Old EFI: the kernel loads a small initramfs itself, and the drivers live on the stick
+
+On a 2011 AMI EFI machine the previous image's kernel started without its
+initramfs and panicked in `mount_root`. The layers, lowest first:
+
+- **The bytes on the stick.** Its `vmlinuz` is byte-identical to this build's
+  (sha256 `2302f2cb…`); its `grub.cfg` loads it and `initrd.img` (563,053,230
+  bytes). The stick's exact FAT span boots to the agent under unmodified OVMF,
+  from an emulated USB stick, so the bytes are sound.
+- **GRUB.** Debian's GRUB 2.12 hands the initrd over through the LoadFile2
+  protocol. With `set debug=linux` its `initrd` command logs `Using LoadFile2
+  initrd loading protocol` and reads nothing; the kernel's EFI stub then asks
+  for the size, allocates the buffer itself (`AllocateMaxAddress` with no
+  effective ceiling), and GRUB copies the file in (`Providing initrd via EFI_LOAD_FILE2_PROTOCOL`, `EFI stub:
+  Loaded initrd from LINUX_EFI_INITRD_MEDIA_GUID device path`). Nothing on this
+  path makes GRUB print an error.
+- **The EFI stub (6.12.96).** `efi_load_initrd_dev_path` returns the status of
+  that allocation unchanged, and `efi_load_initrd` reads `EFI_NOT_FOUND` as "no
+  LoadFile2 device path offered": it falls back to `initrd=` on the command
+  line, finds none, and boots with no initrd, printing nothing. UEFI permits
+  `AllocatePages` to return `EFI_NOT_FOUND` ("the requested pages could not be
+  found"). Every other failure prints `Failed to load initrd` and never starts
+  the kernel. So a kernel that runs with no initramfs means the firmware either
+  refused the 563,053,230-byte buffer with `EFI_NOT_FOUND` or never showed the stub
+  GRUB's LoadFile2 device path.
+
+The target's firmware cannot be run here, so the failure was reproduced against
+a model of it: OVMF rebuilt with one change, refusing any `AllocateMaxAddress`
+request larger than 256 MiB with `EFI_NOT_FOUND`
+(`MdeModulePkg/Core/Dxe/Mem/Page.c`, top of `CoreAllocatePages`):
+
+```
+  if ((Type == AllocateMaxAddress) && (NumberOfPages > EFI_SIZE_TO_PAGES (SIZE_256MB))) {
+    return EFI_NOT_FOUND;
+  }
+```
+
+The previous image's exact bytes, booted from a USB EHCI stick with 4 GB and
+with 8 GB of guest RAM, print the same console the real machine showed, with no
+initrd line anywhere before it:
+
+```
+EFI stub: UEFI Secure Boot is enabled.
+[    1.538374] /dev/root: Can't open blockdev
+[    1.539278] VFS: Cannot open root device "" or unknown-block(0,0): error -6
+[    1.542607] List of all bdev filesystems:
+[    1.543465]  fuseblk
+[    1.546402] Kernel panic - not syncing: VFS: Unable to mount root fs on unknown-block(0,0)
+[    1.555205]  mount_root_generic+0x1ce/0x270
+```
+
+Which of the two silent paths the real firmware takes is not established; the
+fix removes both.
+
+- **No LoadFile2.** GRUB no longer runs `initrd`. The kernel command line
+  carries `initrd=/initrd.img`, and the stub loads the file itself through the
+  firmware's own file protocol: below `initrd_addr_max` (2 GiB) first, in
+  1 MiB reads, and loudly on any failure.
+- **No half-gigabyte initramfs.** The initramfs keeps `init`, the agent and the
+  userland, plus the dependency closure of the drivers that reach the stick
+  (every module under the kernel's USB host, USB storage, ATA, NVMe host, MMC
+  and card-reader trees, `sd_mod`, virtio block and SCSI) and the modules
+  `egdod.mods=` names (`efivarfs`, `loop`, `squashfs`, `vfat`, and the
+  `nls_cp437` and `nls_ascii` codepages the kernel's FAT defaults need). The
+  complete module and firmware set, unchanged, sits beside it on the FAT as
+  `drivers.sqfs`. `init` walks modaliases with the small set — read from each
+  device's `uevent`, now also on the `scsi` and `mmc` buses, so `sd_mod` and
+  `mmc_block` load by alias — mounts each block device's FAT read-only until
+  one holds `drivers.sqfs` with modules for the running kernel, loop-mounts it
+  over `/lib`, and then walks every device against the complete set. Without
+  that file the agent has no network driver, so `init` keeps looking rather
+  than carry on. No driver outside the small set probes before its firmware is
+  reachable.
+
+Both halves are needed: with `initrd=` alone and the stick's 563,053,230-byte
+initramfs, the model firmware makes the stub fail loudly and never start the
+kernel (`Failed to allocate memory for files`, `Failed to load initrd:
+0x800000000000000e`).
+
+What the image weighs now (`sizes.txt`):
+
+| part | size |
+|---|---|
+| `/lib/modules` (complete, in `drivers.sqfs`) | 104 MB |
+| `/lib/firmware` (27 non-free packages, in `drivers.sqfs`) | 436 MB |
+| `drivers.sqfs` (uncompressed squashfs; its contents are already xz) | 520 MB |
+| boot drivers in the initramfs | 3.8 MB |
+| `/bin` and `/nix/store` in the initramfs | 23 MB, 183 MB |
+| `initrd.img` | 90 MB (604 MB with the modules and firmware in it) |
+| `esp.img` | 690 MB |
+
+The fixed image under the same model firmware, from a USB EHCI stick, with 4 GB
+and with 8 GB of guest RAM:
+
+```
+EFI stub: Loaded initrd from command line option
+EFI stub: UEFI Secure Boot is enabled.
+[    0.325429] RAMDISK: [mem 0x6f907000-0x752f7fff]
+[   40.832766] Freeing initrd memory: 92100K
+init: every driver and firmware file from /stick/drivers.sqfs on /dev/sda
+init: egdod PID 1 up, launching agent
+```
+
+It also reaches the agent under unmodified OVMF from IDE, from USB xHCI with 4
+and 8 GB, and from USB EHCI. `boot/run-boot.sh` now boots every image from an
+emulated USB EHCI stick; the wired run, end to end, with `e1000` loaded from
+`drivers.sqfs`:
+
+```
+init: every driver and firmware file from /stick/drivers.sqfs on /dev/sda
+e1000 0000:00:02.0 eth0: Intel(R) PRO/1000 Network Connection
+init: link wired eth0
+init: egdod PID 1 up, launching agent
+uid seen by exec: 0
+SecureBoot value byte is 01: firmware reports Secure Boot on
+NEWROOT-INIT: switch_root landed; the received OS is PID 1 now
+BOOT OK: Secure Boot on, agent dialed out, controller approved and ran as root in the VM.
+```
+
+The station rig, whose `rig.sh` mounts the stick's drivers through `/init.egdod
+drivers` before loading `mac80211_hwsim` from them:
+
+```
+init: every driver and firmware file from /stick/drivers.sqfs on /dev/sda
+RIG: hwsim radios: phy0 phy1 phy2; phy0 stays with the target, the rest go to the rig's netns
+RIG: exec as root over the baked network: uid 0
+RIG: station OK
+BOOT OK (station): Secure Boot on, no wired device, the target reached the controller over wireless and was served as root.
+```
 
 ### No cable: a baked network, and the access point the target hosts when there is none
 
@@ -868,10 +1000,10 @@ anything specified:
   exists for — is untested here.
 - **`direct-wan`.** Three of the four labels were produced. A direct
   internet-routed path needs two hosts.
-- **A boot on real hardware.** The image boots under OVMF with Secure Boot on,
-  the agent runs as PID 1, and the switch_root handoff works (see PROVED above),
-  but a laptop's own firmware is not OVMF. The stick is written; the boot on a
-  physical Secure-Boot machine is the outstanding test.
+- **A boot on real hardware.** On a 2011 AMI EFI machine the previous image's
+  kernel started without its initramfs (see *Old EFI* above); the fixed image
+  has booted only under OVMF, including the model of that failure. Booting it
+  on that machine, or on any physical machine, is the outstanding test.
 - **A real radio.** Every wireless proof ran on `mac80211_hwsim`, whose driver
   needs no firmware and whose radios never lose each other. Whether a laptop's
   Intel, Realtek or Broadcom chip comes up from the firmware set, associates,
@@ -920,7 +1052,7 @@ next round of proving.
   exercised (`e1000`, `e1000e`, `virtio_net`, `mac80211_hwsim`); every other
   driver in the tree is present and its firmware alongside, and the kernel's
   in-place xz firmware load is a documented path, but no such driver has been
-  watched requesting a blob from this initramfs.
+  watched requesting a blob from `drivers.sqfs`.
 - **Any BlueZ controller host connects to the target over LE.** Watched with
   the test host's BlueZ 5.86 and the emulator's dual-mode controller: the
   BR/EDR-not-supported flag in the target's advertisement is what its bearer
