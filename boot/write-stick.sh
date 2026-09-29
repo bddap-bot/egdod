@@ -45,10 +45,4 @@ echo "writing $ISZ bytes of $IMG to $DEV"
 sudo dd if="$IMG" of="$DEV" bs=4M conv=fsync status=progress
 sync
 
-BLOCKS=$(( (ISZ + 4194303) / 4194304 ))
-IMGH=$(sha256sum "$IMG" | cut -d' ' -f1)
-BACKH=$(sudo dd if="$DEV" bs=4M count="$BLOCKS" 2>/dev/null | head -c "$ISZ" | sha256sum | cut -d' ' -f1)
-echo "image sha256:    $IMGH"
-echo "readback sha256: $BACKH"
-[ "$IMGH" = "$BACKH" ] || { echo "MISMATCH: read-back span differs from the image" >&2; exit 1; }
-echo "STICK OK: $DEV holds the image, verified byte-for-byte over its $ISZ-byte span"
+"$HERE/verify-stick.sh" "$IMG" "$DEV"

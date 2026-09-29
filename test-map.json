@@ -67,15 +67,18 @@
     {
       "paths": [
         "boot/write-stick.sh",
+        "boot/verify-stick.sh",
+        "boot/test-verify-stick.sh",
         "boot/networks.sh",
         "boot/bake.sh"
       ],
       "tests": [
         "bash -n boot/write-stick.sh",
         "bash -n boot/networks.sh",
-        "bash -n boot/bake.sh"
+        "bash -n boot/bake.sh",
+        "bash boot/test-verify-stick.sh"
       ],
-      "why": "the guarded physical-stick writer and the two steps it composes — networks.sh reads the writing host's wireless profile as root, write-stick.sh writes a real block device — so the gate checks syntax only; bake.sh is exercised by every run-boot.sh link proof"
+      "why": "the guarded physical-stick writer and the steps it composes — networks.sh reads the writing host's wireless profile as root and write-stick.sh writes a real block device, so those get syntax checks only; verify-stick.sh, the readback, is proven against a loop device (needs non-interactive sudo); bake.sh is exercised by every run-boot.sh link proof"
     },
     {
       "paths": [
