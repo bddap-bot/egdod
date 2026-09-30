@@ -6,7 +6,8 @@ if [ $# -lt 2 ]; then
   echo "usage: write-stick.sh <esp-image> <device-by-id-path> [--no-host] [--network SSID PSK]..." >&2
   echo "  bakes the wireless networks the stick may join (networks.sh) into the image, then" >&2
   echo "  writes ONLY to the block device the by-id path resolves to, and only if it is an" >&2
-  echo "  unmounted ~30G USB disk; refuses everything else." >&2
+  echo "  unmounted ~30G USB disk; refuses everything else. With no networks (--no-host), the" >&2
+  echo "  image is written unchanged: a wired-only stick." >&2
   exit 2
 fi
 SRC=$(readlink -f "$1")
@@ -36,9 +37,12 @@ T=$(mktemp -d "${TMPDIR:-/tmp}/egdod-stick.XXXXXX")
 trap 'rm -rf "$T"' EXIT
 mkdir "$T/overlay"
 "$HERE/networks.sh" "$@" > "$T/overlay/wpa_supplicant.conf"
-[ -s "$T/overlay/wpa_supplicant.conf" ] || rm "$T/overlay/wpa_supplicant.conf"
-"$HERE/bake.sh" "$SRC" "$T/esp.img" "$T/overlay"
-IMG=$T/esp.img
+if [ -s "$T/overlay/wpa_supplicant.conf" ]; then
+  "$HERE/bake.sh" "$SRC" "$T/esp.img" "$T/overlay"
+  IMG=$T/esp.img
+else
+  IMG=$SRC
+fi
 
 ISZ=$(stat -c%s "$IMG")
 echo "writing $ISZ bytes of $IMG to $DEV"
