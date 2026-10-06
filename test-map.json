@@ -23,9 +23,10 @@
         "nix-shell --run 'cargo test'",
         "nix-build musl.nix -o result-gate",
         "nix-build default.nix -o result-host-gate",
-        "nix-build boot/image.nix -o result-boot-gate"
+        "nix-build boot/image.nix -o result-boot-gate",
+        "nix-shell --run 'cargo audit'"
       ],
-      "why": "admission and the authenticated BLE credential hop span the existing binary, its static initramfs build and the BlueZ closure in the boot image; all three artifacts must build and the protocol plus existing UDP patch must remain green"
+      "why": "admission and the authenticated BLE credential hop span the existing binary, its static initramfs build and the BlueZ closure in the boot image; all three artifacts must build, the protocol plus existing UDP patch must remain green, and the lockfile must carry no crate with a published vulnerability advisory"
     },
     {
       "paths": [

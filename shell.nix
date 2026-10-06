@@ -5,5 +5,5 @@ let
 in
 pkgs.mkShell {
   # openssh/coreutils are demo.sh dependencies, not build dependencies.
-  nativeBuildInputs = with pkgs; [ cargo rustc clippy gcc pkg-config openssh ];
+  nativeBuildInputs = with pkgs; [ cargo cargo-audit rustc clippy gcc pkg-config openssh ];
 }
